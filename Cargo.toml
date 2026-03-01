@@ -1,0 +1,38 @@
+[package]
+name = "ida-mcp-skill"
+version = "0.9.3"
+edition = "2021"
+description = "IDA Pro MCP server for Solana program reverse engineering"
+license = "MIT"
+repository = "https://github.com/pingzi/ida-mcp-skill"
+authors = ["pingzi"]
+keywords = ["ida", "mcp", "reverse-engineering", "disassembly", "decompiler"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+idalib = { path = "3rd-github/idalib/idalib" }
+rmcp = { version = "0.15", features = ["server", "transport-io", "transport-streamable-http-server"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "signal", "process", "io-util", "time"] }
+tokio-util = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1.2"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+bytes = "1"
+http-body = "1"
+http-body-util = "0.1"
+tower-service = "0.3"
+
+[build-dependencies]
+idalib-build = { path = "3rd-github/idalib/idalib-build" }
+
+[[bin]]
+name = "multi_idb_probe"
+path = "tests/multi_idb_probe.rs"

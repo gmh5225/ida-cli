@@ -1,0 +1,80 @@
+db1: 2 functions
+
+[SINGLE-PROCESS PROBE RESULT]
+Status: TIMEOUT on second open
+Interpretation: idalib.open() blocks indefinitely when attempting to open a second database
+  without closing the first. This proves the API is NOT thread-safe and does NOT support
+  concurrent database handles within a single process.
+
+Implication for Phase 1:
+- Cannot use multiple IDB handles in a single process
+- Worker mode MUST serialize all database operations
+- Each request must acquire exclusive lock on IDA state
+
+[MULTI-PROCESS CONCURRENCY PROBE RESULT]
+Process 1 exit code: 0
+Process 2 exit code: 0
+Status: SUCCESS - Both processes completed successfully
+Interpretation: IDA license allows TWO SEPARATE ida-mcp processes to run concurrently.
+  Each process initializes its own IDA library instance and opens a database independently.
+
+Implication for Phase 1:
+- Multi-process architecture is VIABLE
+- Each ida-mcp worker can run in its own process with its own IDA instance
+- No license conflicts when running multiple workers in parallel
+
+[PHASE 0 CONCLUSION]
+✅ GO: Proceed to Phase 1 (Worker mode implementation)
+- Single-process constraint: Use mutex/lock for serialized IDA access
+- Multi-process capability: License supports concurrent workers
+- Architecture: Each worker = separate process + separate IDA instance
+
+Process 1 output:
+[2m2026-02-27T22:50:07.363992Z[0m [32m INFO[0m [2mida_mcp[0m[2m:[0m Starting IDA MCP Server (probe mode)
+[2m2026-02-27T22:50:07.364088Z[0m [32m INFO[0m [2mida_mcp[0m[2m:[0m Initializing IDA library on main thread
+[2m2026-02-27T22:50:07.726769Z[0m [32m INFO[0m [2mida_mcp[0m[2m:[0m IDA library initialized successfully
+[2m2026-02-27T22:50:07.726848Z[0m [32m INFO[0m [2mida_mcp[0m[2m:[0m IDA version 9.0.260213
+[2m2026-02-27T22:50:07.726946Z[0m [32m INFO[0m [2mida_mcp[0m[2m:[0m Opening database: test/fixtures/mini
+[2m2026-02-27T22:50:07.727082Z[0m [32m INFO[0m [2mida_mcp[0m[2m:[0m Opening raw binary with auto-analysis (idb_out=/tmp/probe_test/mini_concurrent.i64)
+[2m2026-02-27T22:50:17.731377Z[0m [32m INFO[0m [2mida_mcp[0m[2m:[0m Database opened in 10s
+{
+  "path": "test/fixtures/mini",
+  "file_type": "MACHO",
+  "processor": "ARM Little-endian",
+  "bits": 64,
+  "function_count": 2,
+  "debug_info": null,
+  "analysis_status": {
+    "auto_enabled": true,
+    "auto_is_ok": true,
+    "auto_state": "AU_NONE",
+    "auto_state_id": 0,
+    "analysis_running": false
+  }
+}
+[2m2026-02-27T22:50:17.734309Z[0m [32m INFO[0m [2mida_mcp[0m[2m:[0m Probe completed
+
+Process 2 output:
+[2m2026-02-27T22:50:09.476082Z[0m [32m INFO[0m [2mida_mcp[0m[2m:[0m Starting IDA MCP Server (probe mode)
+[2m2026-02-27T22:50:09.476135Z[0m [32m INFO[0m [2mida_mcp[0m[2m:[0m Initializing IDA library on main thread
+[2m2026-02-27T22:50:09.841158Z[0m [32m INFO[0m [2mida_mcp[0m[2m:[0m IDA library initialized successfully
+[2m2026-02-27T22:50:09.841206Z[0m [32m INFO[0m [2mida_mcp[0m[2m:[0m IDA version 9.0.260213
+[2m2026-02-27T22:50:09.841227Z[0m [32m INFO[0m [2mida_mcp[0m[2m:[0m Opening database: test/fixtures/mini2
+[2m2026-02-27T22:50:09.841265Z[0m [32m INFO[0m [2mida_mcp[0m[2m:[0m Opening raw binary with auto-analysis (idb_out=/tmp/probe_test/mini2_concurrent.i64)
+[2m2026-02-27T22:50:19.843792Z[0m [32m INFO[0m [2mida_mcp[0m[2m:[0m Database opened in 10s
+{
+  "path": "test/fixtures/mini2",
+  "file_type": "MACHO",
+  "processor": "ARM Little-endian",
+  "bits": 64,
+  "function_count": 2,
+  "debug_info": null,
+  "analysis_status": {
+    "auto_enabled": true,
+    "auto_is_ok": true,
+    "auto_state": "AU_NONE",
+    "auto_state_id": 0,
+    "analysis_running": false
+  }
+}
+[2m2026-02-27T22:50:19.843884Z[0m [32m INFO[0m [2mida_mcp[0m[2m:[0m Probe completed

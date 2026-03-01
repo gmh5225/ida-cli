@@ -1,0 +1,4 @@
+[submodule "3rd-github/idalib"]
+	path = 3rd-github/idalib
+	url = https://github.com/cpkt9762/idalib.git
+	branch = ida-mcp-extensions

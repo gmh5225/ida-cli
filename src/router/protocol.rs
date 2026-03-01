@@ -1,0 +1,111 @@
+//! JSON-RPC 2.0 wire types for router ↔ worker communication.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Serialisable request envelope sent from router to worker stdin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcRequest {
+    pub jsonrpc: String,
+    pub id: String,
+    pub method: String,
+    pub params: Value,
+}
+
+/// Serialisable response envelope sent from worker stdout to router.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcResponse {
+    pub jsonrpc: String,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<RpcError>,
+}
+
+/// JSON-RPC error object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcError {
+    pub code: i64,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+impl RpcRequest {
+    pub fn new(id: impl Into<String>, method: impl Into<String>, params: Value) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id: id.into(),
+            method: method.into(),
+            params,
+        }
+    }
+}
+
+impl RpcResponse {
+    pub fn ok(id: impl Into<String>, result: Value) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id: id.into(),
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    pub fn err(id: impl Into<String>, code: i64, message: impl Into<String>) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id: id.into(),
+            result: None,
+            error: Some(RpcError {
+                code,
+                message: message.into(),
+                data: None,
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_rpc_request_roundtrip() {
+        let req = RpcRequest::new("r1", "decompile", json!({"addr": 4096}));
+        let json_str = serde_json::to_string(&req).unwrap();
+        let decoded: RpcRequest = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(decoded.id, "r1");
+        assert_eq!(decoded.method, "decompile");
+        assert_eq!(decoded.jsonrpc, "2.0");
+    }
+
+    #[test]
+    fn test_rpc_response_ok() {
+        let resp = RpcResponse::ok("r1", json!({"code": "int main(){...}"}));
+        let json_str = serde_json::to_string(&resp).unwrap();
+        let decoded: RpcResponse = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(decoded.id, "r1");
+        assert!(decoded.result.is_some());
+        assert!(decoded.error.is_none());
+    }
+
+    #[test]
+    fn test_rpc_response_err() {
+        let resp = RpcResponse::err("r2", -32000, "no IDB open");
+        let json_str = serde_json::to_string(&resp).unwrap();
+        let decoded: RpcResponse = serde_json::from_str(&json_str).unwrap();
+        assert!(decoded.result.is_none());
+        assert!(decoded.error.is_some());
+        assert_eq!(decoded.error.unwrap().message, "no IDB open");
+    }
+
+    #[test]
+    fn test_optional_fields_not_serialized() {
+        let resp = RpcResponse::ok("r1", json!({}));
+        let json_str = serde_json::to_string(&resp).unwrap();
+        assert!(!json_str.contains("\"error\""));
+    }
+}

@@ -1,0 +1,6 @@
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"multi-test","version":"0.1"},"capabilities":{}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_idb","arguments":{"path":"fixtures/mini","load_debug_info":true}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"open_idb","arguments":{"path":"fixtures/mini2","load_debug_info":true}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}
