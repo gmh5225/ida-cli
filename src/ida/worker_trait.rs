@@ -181,6 +181,15 @@ pub trait WorkerDispatch {
         prototype: String,
     ) -> Result<Value, ToolError>;
 
+    async fn list_enums(
+        &self,
+        filter: Option<String>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Value, ToolError>;
+
+    async fn create_enum(&self, decl: String, replace: bool) -> Result<Value, ToolError>;
+
     // ── Address info ────────────────────────────────────────────────────
 
     async fn addr_info(
@@ -211,6 +220,22 @@ pub trait WorkerDispatch {
     ) -> Result<StackVarResult, ToolError>;
 
     async fn stack_frame(&self, addr: u64) -> Result<FrameInfo, ToolError>;
+
+    async fn rename_stack_variable(
+        &self,
+        func_addr: Option<u64>,
+        func_name: Option<String>,
+        old_name: String,
+        new_name: String,
+    ) -> Result<Value, ToolError>;
+
+    async fn set_stack_variable_type(
+        &self,
+        func_addr: Option<u64>,
+        func_name: Option<String>,
+        var_name: String,
+        type_decl: String,
+    ) -> Result<Value, ToolError>;
 
     // ── Structs ─────────────────────────────────────────────────────────
 

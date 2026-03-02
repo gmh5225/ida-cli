@@ -439,6 +439,32 @@ impl IdaWorker {
         rx.await?
     }
 
+    pub async fn list_enums(
+        &self,
+        filter: Option<String>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::ListEnums {
+            filter,
+            offset,
+            limit,
+            resp: tx,
+        })?;
+        rx.await?
+    }
+
+    pub async fn create_enum(&self, decl: String, replace: bool) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::CreateEnum {
+            decl,
+            replace,
+            resp: tx,
+        })?;
+        rx.await?
+    }
+
     /// Get address context (segment, function, symbol).
     pub async fn addr_info(
         &self,
@@ -538,6 +564,42 @@ impl IdaWorker {
     pub async fn stack_frame(&self, addr: u64) -> Result<FrameInfo, ToolError> {
         let (tx, rx) = oneshot::channel();
         self.try_send(IdaRequest::StackFrame { addr, resp: tx })?;
+        rx.await?
+    }
+
+    pub async fn rename_stack_variable(
+        &self,
+        func_addr: Option<u64>,
+        func_name: Option<String>,
+        old_name: String,
+        new_name: String,
+    ) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::RenameStackVariable {
+            func_addr,
+            func_name,
+            old_name,
+            new_name,
+            resp: tx,
+        })?;
+        rx.await?
+    }
+
+    pub async fn set_stack_variable_type(
+        &self,
+        func_addr: Option<u64>,
+        func_name: Option<String>,
+        var_name: String,
+        type_decl: String,
+    ) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::SetStackVariableType {
+            func_addr,
+            func_name,
+            var_name,
+            type_decl,
+            resp: tx,
+        })?;
         rx.await?
     }
 
@@ -1407,6 +1469,19 @@ impl WorkerDispatch for IdaWorker {
         self.set_function_prototype(addr, name, prototype).await
     }
 
+    async fn list_enums(
+        &self,
+        filter: Option<String>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Value, ToolError> {
+        self.list_enums(filter, offset, limit).await
+    }
+
+    async fn create_enum(&self, decl: String, replace: bool) -> Result<Value, ToolError> {
+        self.create_enum(decl, replace).await
+    }
+
     async fn addr_info(
         &self,
         addr: Option<u64>,
@@ -1441,6 +1516,28 @@ impl WorkerDispatch for IdaWorker {
 
     async fn stack_frame(&self, addr: u64) -> Result<FrameInfo, ToolError> {
         self.stack_frame(addr).await
+    }
+
+    async fn rename_stack_variable(
+        &self,
+        func_addr: Option<u64>,
+        func_name: Option<String>,
+        old_name: String,
+        new_name: String,
+    ) -> Result<Value, ToolError> {
+        self.rename_stack_variable(func_addr, func_name, old_name, new_name)
+            .await
+    }
+
+    async fn set_stack_variable_type(
+        &self,
+        func_addr: Option<u64>,
+        func_name: Option<String>,
+        var_name: String,
+        type_decl: String,
+    ) -> Result<Value, ToolError> {
+        self.set_stack_variable_type(func_addr, func_name, var_name, type_decl)
+            .await
     }
 
     async fn structs(

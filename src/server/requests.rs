@@ -594,6 +594,39 @@ pub struct DeleteStackRequest {
     pub var_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct RenameStackVariableRequest {
+    pub func_address: Option<Value>,
+    pub func_name: Option<String>,
+    pub name: String,
+    pub new_name: String,
+    pub db_handle: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct SetStackVariableTypeRequest {
+    pub func_address: Option<Value>,
+    pub func_name: Option<String>,
+    pub name: String,
+    pub type_decl: String,
+    pub db_handle: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct ListEnumsRequest {
+    pub filter: Option<String>,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+    pub db_handle: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct CreateEnumRequest {
+    pub decl: String,
+    pub replace: Option<bool>,
+    pub db_handle: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct XrefsToFieldRequest {
     #[schemars(

@@ -374,6 +374,31 @@ pub async fn dispatch_rpc<W: WorkerDispatch>(
                 .set_function_prototype(addr, req.name, req.prototype)
                 .await
         }
+        "rename_stack_variable" => {
+            let req: RenameStackVariableRequest = parse_params(p)?;
+            let addr = req.func_address.as_ref().and_then(parse_address_value);
+            worker
+                .rename_stack_variable(addr, req.func_name, req.name, req.new_name)
+                .await
+        }
+        "set_stack_variable_type" => {
+            let req: SetStackVariableTypeRequest = parse_params(p)?;
+            let addr = req.func_address.as_ref().and_then(parse_address_value);
+            worker
+                .set_stack_variable_type(addr, req.func_name, req.name, req.type_decl)
+                .await
+        }
+        "list_enums" => {
+            let req: ListEnumsRequest = parse_params(p)?;
+            let offset = req.offset.unwrap_or(0);
+            let limit = req.limit.unwrap_or(100);
+            worker.list_enums(req.filter, offset, limit).await
+        }
+        "create_enum" => {
+            let req: CreateEnumRequest = parse_params(p)?;
+            let replace = req.replace.unwrap_or(false);
+            worker.create_enum(req.decl, replace).await
+        }
 
         // ── Address info ─────────────────────────────────────────────────
         "get_address_info" => {
@@ -1497,6 +1522,24 @@ pub mod mock {
             Ok(json!({}))
         }
 
+        async fn list_enums(
+            &self,
+            filter: Option<String>,
+            offset: usize,
+            limit: usize,
+        ) -> Result<Value, ToolError> {
+            self.record(
+                "list_enums",
+                json!({"filter": filter, "offset": offset, "limit": limit}),
+            );
+            Ok(json!({}))
+        }
+
+        async fn create_enum(&self, decl: String, replace: bool) -> Result<Value, ToolError> {
+            self.record("create_enum", json!({"decl": decl, "replace": replace}));
+            Ok(json!({}))
+        }
+
         async fn addr_info(
             &self,
             addr: Option<u64>,
@@ -1548,6 +1591,44 @@ pub mod mock {
         async fn stack_frame(&self, addr: u64) -> Result<FrameInfo, ToolError> {
             self.record("stack_frame", json!({"addr": addr}));
             Ok(default_frame_info())
+        }
+
+        async fn rename_stack_variable(
+            &self,
+            func_addr: Option<u64>,
+            func_name: Option<String>,
+            old_name: String,
+            new_name: String,
+        ) -> Result<Value, ToolError> {
+            self.record(
+                "rename_stack_variable",
+                json!({
+                    "func_addr": func_addr,
+                    "func_name": func_name,
+                    "old_name": old_name,
+                    "new_name": new_name,
+                }),
+            );
+            Ok(json!({}))
+        }
+
+        async fn set_stack_variable_type(
+            &self,
+            func_addr: Option<u64>,
+            func_name: Option<String>,
+            var_name: String,
+            type_decl: String,
+        ) -> Result<Value, ToolError> {
+            self.record(
+                "set_stack_variable_type",
+                json!({
+                    "func_addr": func_addr,
+                    "func_name": func_name,
+                    "var_name": var_name,
+                    "type_decl": type_decl,
+                }),
+            );
+            Ok(json!({}))
         }
 
         async fn structs(

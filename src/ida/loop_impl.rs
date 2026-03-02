@@ -338,6 +338,83 @@ pub fn run_ida_loop(rx: mpsc::Receiver<EnqueuedRequest>) {
                 );
                 let _ = resp.send(result);
             }
+            IdaRequest::RenameStackVariable {
+                func_addr,
+                func_name,
+                old_name,
+                new_name,
+                resp,
+            } => {
+                debug!(
+                    func_addr = ?func_addr,
+                    func_name = ?func_name,
+                    old_name,
+                    new_name,
+                    "Renaming stack variable"
+                );
+                let result = types::handle_rename_stack_variable(
+                    &idb,
+                    func_addr,
+                    func_name.as_deref(),
+                    &old_name,
+                    &new_name,
+                );
+                log_result!(
+                    result,
+                    "Renamed stack variable",
+                    "Failed to rename stack variable"
+                );
+                let _ = resp.send(result);
+            }
+            IdaRequest::SetStackVariableType {
+                func_addr,
+                func_name,
+                var_name,
+                type_decl,
+                resp,
+            } => {
+                debug!(
+                    func_addr = ?func_addr,
+                    func_name = ?func_name,
+                    var_name,
+                    type_decl,
+                    "Setting stack variable type"
+                );
+                let result = types::handle_set_stack_variable_type(
+                    &idb,
+                    func_addr,
+                    func_name.as_deref(),
+                    &var_name,
+                    &type_decl,
+                );
+                log_result!(
+                    result,
+                    "Set stack variable type",
+                    "Failed to set stack variable type"
+                );
+                let _ = resp.send(result);
+            }
+            IdaRequest::ListEnums {
+                filter,
+                offset,
+                limit,
+                resp,
+            } => {
+                debug!(offset, limit, filter = ?filter, "Listing enums");
+                let result = types::handle_list_enums(&idb, filter.as_deref(), offset, limit);
+                log_result!(result, "Listed enums", "Failed to list enums");
+                let _ = resp.send(result);
+            }
+            IdaRequest::CreateEnum {
+                decl,
+                replace,
+                resp,
+            } => {
+                debug!(replace, "Creating enum");
+                let result = types::handle_create_enum(&idb, &decl, replace);
+                log_result!(result, "Created enum", "Failed to create enum");
+                let _ = resp.send(result);
+            }
             IdaRequest::AddrInfo {
                 addr,
                 name,

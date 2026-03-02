@@ -3544,6 +3544,121 @@ impl IdaMcpServer {
         }
     }
 
+    #[tool(description = "Rename a stack frame variable in a function")]
+    async fn rename_stack_variable(
+        &self,
+        Parameters(req): Parameters<RenameStackVariableRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if let ServerMode::Router(ref router) = self.mode {
+            return self
+                .route_or_err(
+                    router,
+                    req.db_handle.as_deref(),
+                    "rename_stack_variable",
+                    serde_json::to_value(&req).unwrap_or_default(),
+                )
+                .await;
+        }
+
+        let func_addr = req
+            .func_address
+            .as_ref()
+            .and_then(crate::rpc_dispatch::parse_address_value);
+        match self
+            .worker
+            .rename_stack_variable(func_addr, req.func_name, req.name, req.new_name)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}")),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Set the type of a stack frame variable")]
+    async fn set_stack_variable_type(
+        &self,
+        Parameters(req): Parameters<SetStackVariableTypeRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if let ServerMode::Router(ref router) = self.mode {
+            return self
+                .route_or_err(
+                    router,
+                    req.db_handle.as_deref(),
+                    "set_stack_variable_type",
+                    serde_json::to_value(&req).unwrap_or_default(),
+                )
+                .await;
+        }
+
+        let func_addr = req
+            .func_address
+            .as_ref()
+            .and_then(crate::rpc_dispatch::parse_address_value);
+        match self
+            .worker
+            .set_stack_variable_type(func_addr, req.func_name, req.name, req.type_decl)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}")),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "List all enum types in the database")]
+    async fn list_enums(
+        &self,
+        Parameters(req): Parameters<ListEnumsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if let ServerMode::Router(ref router) = self.mode {
+            return self
+                .route_or_err(
+                    router,
+                    req.db_handle.as_deref(),
+                    "list_enums",
+                    serde_json::to_value(&req).unwrap_or_default(),
+                )
+                .await;
+        }
+
+        let offset = req.offset.unwrap_or(0);
+        let limit = req.limit.unwrap_or(100);
+        match self.worker.list_enums(req.filter, offset, limit).await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}")),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Create an enum type from a C declaration")]
+    async fn create_enum(
+        &self,
+        Parameters(req): Parameters<CreateEnumRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if let ServerMode::Router(ref router) = self.mode {
+            return self
+                .route_or_err(
+                    router,
+                    req.db_handle.as_deref(),
+                    "create_enum",
+                    serde_json::to_value(&req).unwrap_or_default(),
+                )
+                .await;
+        }
+
+        let replace = req.replace.unwrap_or(false);
+        match self.worker.create_enum(req.decl, replace).await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}")),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
     #[tool(
         description = "List structs in the database with pagination and optional filter. \
         For large databases, consider setting timeout_secs (default: 120, max: 600)."
@@ -4721,10 +4836,10 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "create_stack_variable" => Some(schema::<DeclareStackRequest>()),
         "delete_stack_variable" => Some(schema::<DeleteStackRequest>()),
         "get_function_prototype" => Some(schema::<GetFunctionPrototypeRequest>()),
-        "rename_stack_variable" => Some(schema::<EmptyParams>()),
-        "set_stack_variable_type" => Some(schema::<EmptyParams>()),
-        "list_enums" => Some(schema::<EmptyParams>()),
-        "create_enum" => Some(schema::<EmptyParams>()),
+        "rename_stack_variable" => Some(schema::<RenameStackVariableRequest>()),
+        "set_stack_variable_type" => Some(schema::<SetStackVariableTypeRequest>()),
+        "list_enums" => Some(schema::<ListEnumsRequest>()),
+        "create_enum" => Some(schema::<CreateEnumRequest>()),
 
         // Scripting
         "run_script" => Some(schema::<RunScriptRequest>()),

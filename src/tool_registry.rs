@@ -1010,6 +1010,30 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         aliases: &["delete_stack"],
     },
     ToolInfo {
+        name: "list_enums",
+        category: ToolCategory::Types,
+        short_desc: "List all enum types in the database",
+        full_desc: "List all enum type definitions in the IDA local types database. \
+                    Returns each enum name and C declaration. \
+                    Supports filtering by name substring and pagination.",
+        example: r#"{"filter": "Error", "limit": 20}"#,
+        default: false,
+        keywords: &["enum", "types", "local", "list", "names"],
+        aliases: &[],
+    },
+    ToolInfo {
+        name: "create_enum",
+        category: ToolCategory::Types,
+        short_desc: "Create an enum type from a C declaration",
+        full_desc: "Create a new enum type in the IDA local types database from a C declaration string. \
+                    Example: \"enum ErrorCode { OK = 0, ERR_INVALID = 1, ERR_OVERFLOW = 2 };\". \
+                    Use list_enums to verify. Use declare_c_type for structs.",
+        example: r#"{"decl": "enum SwapResult { SWAP_OK = 0, SWAP_ERR_SLIPPAGE = 1, SWAP_ERR_FUNDS = 2 };"}"#,
+        default: false,
+        keywords: &["enum", "create", "type", "declare", "define"],
+        aliases: &[],
+    },
+    ToolInfo {
         name: "list_structs",
         category: ToolCategory::Types,
         short_desc: "List structs with pagination",
@@ -1164,6 +1188,30 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["type", "lvar", "local", "variable", "decompiler", "pseudocode", "retype"],
         aliases: &["set_lvar_type"],
+    },
+    ToolInfo {
+        name: "rename_stack_variable",
+        category: ToolCategory::Editing,
+        short_desc: "Rename a stack frame variable in a function",
+        full_desc: "Rename a local variable in a function stack frame. \
+                    Locates the variable by its current name and renames it. \
+                    Requires a valid function address or name.",
+        example: r#"{"func_address": "0x100000f00", "name": "var_4", "new_name": "buffer_size"}"#,
+        default: false,
+        keywords: &["rename", "stack", "variable", "frame", "local"],
+        aliases: &[],
+    },
+    ToolInfo {
+        name: "set_stack_variable_type",
+        category: ToolCategory::Editing,
+        short_desc: "Set the type of a stack frame variable",
+        full_desc: "Set the type of a local variable in a function stack frame. \
+                    Accepts C type declaration strings (e.g. \"char *\", \"DWORD\", \"void *\"). \
+                    Different from set_local_variable_type which works on Hex-Rays variables.",
+        example: r#"{"func_address": "0x100000f00", "name": "buffer_size", "type_decl": "int"}"#,
+        default: false,
+        keywords: &["type", "stack", "variable", "frame", "local", "retype"],
+        aliases: &[],
     },
     ToolInfo {
         name: "set_decompiler_comment",

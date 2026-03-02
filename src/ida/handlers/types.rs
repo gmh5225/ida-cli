@@ -297,3 +297,175 @@ pub fn handle_delete_stack(
         status: status.to_string(),
     })
 }
+
+pub fn handle_rename_stack_variable(
+    idb: &Option<IDB>,
+    func_addr: Option<u64>,
+    func_name: Option<&str>,
+    old_name: &str,
+    new_name: &str,
+) -> Result<serde_json::Value, ToolError> {
+    let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    let func_ea = resolve_address(idb, func_addr, func_name, 0)?;
+
+    let frame = db
+        .frame_info(func_ea)
+        .ok_or(ToolError::FunctionNotFound(func_ea))?;
+
+    let mut found_offset = None;
+    let mut found_type = String::new();
+    for idx in 0..frame.member_count {
+        if let Some(member) = db.frame_member(func_ea, idx) {
+            if member.name == old_name {
+                found_offset = Some(member.offset_bits as i64 / 8 - frame.frsize as i64);
+                found_type = member.type_name;
+                break;
+            }
+        }
+    }
+
+    let offset = found_offset.ok_or_else(|| {
+        ToolError::IdaError(format!(
+            "Stack variable '{}' not found in function at {:#x}",
+            old_name, func_ea
+        ))
+    })?;
+
+    let result = idalib::frame::define_stack_var(
+        func_ea,
+        Some(new_name),
+        offset,
+        if found_type.is_empty() {
+            "int"
+        } else {
+            found_type.as_str()
+        },
+        true,
+    );
+
+    if result.code < 0 {
+        return Err(ToolError::IdaError(format!(
+            "Failed to rename stack variable: code {}",
+            result.code
+        )));
+    }
+
+    Ok(serde_json::json!({
+        "func_address": format!("{:#x}", func_ea),
+        "old_name": old_name,
+        "new_name": result.name,
+        "offset": offset,
+    }))
+}
+
+pub fn handle_set_stack_variable_type(
+    idb: &Option<IDB>,
+    func_addr: Option<u64>,
+    func_name: Option<&str>,
+    var_name: &str,
+    type_decl: &str,
+) -> Result<serde_json::Value, ToolError> {
+    idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    let func_ea = resolve_address(idb, func_addr, func_name, 0)?;
+
+    let result = idalib::frame::set_stack_var_type(
+        func_ea,
+        Some(var_name),
+        0,
+        false,
+        type_decl,
+        true,
+        false,
+    );
+
+    if result.code < 0 {
+        return Err(ToolError::IdaError(format!(
+            "Failed to set type for '{}': code {}",
+            var_name, result.code
+        )));
+    }
+
+    Ok(serde_json::json!({
+        "func_address": format!("{:#x}", func_ea),
+        "variable": result.name,
+        "type": type_decl,
+    }))
+}
+
+pub fn handle_list_enums(
+    idb: &Option<IDB>,
+    filter: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> Result<serde_json::Value, ToolError> {
+    let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    let filter_lower = filter.map(|f| f.to_lowercase());
+
+    let mut total = 0usize;
+    let mut enums = Vec::new();
+    let ordinal_limit = db.udt_ordinal_limit();
+
+    for ordinal in 1..ordinal_limit {
+        let info = match db.local_type_info(ordinal) {
+            Some(info) => info,
+            None => continue,
+        };
+
+        if info.kind != "enum" {
+            continue;
+        }
+
+        if let Some(f) = &filter_lower {
+            if !info.name.to_lowercase().contains(f) {
+                continue;
+            }
+        }
+
+        total += 1;
+        if total <= offset {
+            continue;
+        }
+        if enums.len() >= limit {
+            continue;
+        }
+
+        enums.push(serde_json::json!({
+            "ordinal": info.ordinal,
+            "name": info.name,
+            "decl": info.decl,
+        }));
+    }
+
+    let next_offset = if offset.saturating_add(enums.len()) < total {
+        Some(offset.saturating_add(enums.len()))
+    } else {
+        None
+    };
+
+    Ok(serde_json::json!({
+        "enums": enums,
+        "total": total,
+        "next_offset": next_offset,
+    }))
+}
+
+pub fn handle_create_enum(
+    idb: &Option<IDB>,
+    decl: &str,
+    replace: bool,
+) -> Result<serde_json::Value, ToolError> {
+    let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    let result = db.declare_type(decl, true, replace);
+    if result.code < 0 {
+        return Err(ToolError::IdaError(format!(
+            "Failed to create enum (code {}): {}",
+            result.code, decl
+        )));
+    }
+    Ok(serde_json::json!({
+        "name": result.name,
+        "kind": result.kind,
+        "decl": result.decl,
+        "code": result.code,
+    }))
+}
