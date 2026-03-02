@@ -726,6 +726,118 @@ impl IdaMcpServer {
     }
 
     #[tool(
+        description = "Open a Solana sBPF program (.so) for analysis. \
+        Automatically AOT-compiles the sBPF binary to a host-native shared library via sbpf2host \
+        (if needed), then opens the result in IDA Pro with full Hex-Rays decompilation support. \
+        Fast-path tiers (checked in order): \
+          1. <program>.dylib.i64 exists  → open directly, skip sbpf2host (fastest, all renames preserved) \
+          2. <program>.dylib.id0 exists  → open unpacked IDA DB, skip sbpf2host \
+          3. <program>.dylib exists      → open dylib, skip sbpf2host \
+          4. none of the above           → run sbpf2host then open \
+        Existing locked databases (live .imcp) are detected and reported as DatabaseLocked. \
+        Dead-process lock files (.imcp with stale PID) are cleaned automatically. \
+        Debug symbols (.dSYM) are loaded automatically when present. \
+        Returns db_handle, close_token, sbpf_source, dylib_path, and compiled=true/false. \
+        Requires sbpf2host (cargo install sbpf2host) or SBPF2HOST env var. \
+        Example: open_sbpf(path: '~/programs/675kPX9.so')"
+    )]
+    #[instrument(skip(self), fields(path = %req.path))]
+    async fn open_sbpf(
+        &self,
+        Parameters(req): Parameters<OpenSbpfRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: open_sbpf");
+
+        if !Self::validate_path(&req.path) {
+            return Ok(ToolError::InvalidPath(req.path).to_tool_result());
+        }
+
+        // Override sbpf2host binary if caller specified an explicit path.
+        if let Some(ref explicit) = req.sbpf2host_path {
+            // SAFETY: set env only in this process; we're single-threaded at this point.
+            // Using a temp env override so find_sbpf2host() picks it up.
+            std::env::set_var("SBPF2HOST", explicit);
+        }
+
+        let input = crate::expand_path(&req.path);
+        let output_dir = req.output_dir.as_deref().map(std::path::Path::new);
+        let dump_ir = req.dump_ir.unwrap_or(false);
+
+        // Compute the expected dylib output path (e.g. program.dylib on macOS).
+        let dylib_path = crate::sbpf::sbpf2host_output_path(&input, output_dir);
+        let dylib_str = dylib_path.display().to_string();
+
+        // IDA replaces the dylib extension with its database extension:
+        //   program.dylib  →  program.i64  (packed)
+        //   program.dylib  →  program.id0  (unpacked)
+        let i64_path = dylib_path.with_extension("i64");
+        let id0_path = dylib_path.with_extension("id0");
+
+        // Determine open path and whether sbpf2host compilation is needed.
+        // Lock detection (live .imcp) and stale-lock cleanup happen inside handle_open.
+        let (open_path_str, compiled, load_debug) = if i64_path.exists() {
+            // Fast path 1: packed .i64 exists — skip sbpf2host entirely.
+            info!(path = %i64_path.display(), "open_sbpf fast-path: existing .i64");
+            (i64_path.display().to_string(), false, false)
+        } else if id0_path.exists() {
+            // Fast path 2: unpacked .id0 exists — skip sbpf2host.
+            // Pass the dylib path; IDA/handle_open will find the adjacent .id0.
+            info!(path = %id0_path.display(), "open_sbpf fast-path: existing unpacked .id0");
+            (dylib_str.clone(), false, false)
+        } else if dylib_path.exists() {
+            // Fast path 3: dylib exists but no IDA database — skip sbpf2host.
+            let has_dsym = crate::sbpf::sbpf2host_dsym_path(&dylib_path).exists();
+            info!(path = %dylib_path.display(), "open_sbpf fast-path: existing dylib (skipping sbpf2host)");
+            (dylib_str.clone(), false, has_dsym)
+        } else {
+            // Full path: compile sBPF → host-native dylib via sbpf2host.
+            let result = match crate::sbpf::run_sbpf2host(&input, output_dir, dump_ir) {
+                Ok(r) => r,
+                Err(e) => return Ok(e.to_tool_result()),
+            };
+            let has_dsym = result.has_debug_info;
+            (result.dylib_path.display().to_string(), true, has_dsym)
+        };
+
+        let idb_req = OpenIdbRequest {
+            path: open_path_str.clone(),
+            load_debug_info: Some(load_debug),
+            debug_info_path: None,
+            debug_info_verbose: None,
+            force: None,
+            file_type: None,
+        };
+
+        // Delegate to open_idb routing (handles close_token, db_handle, quick_tools).
+        let mut result = if let ServerMode::Router(ref router) = self.mode {
+            self.open_idb_routed(router, &idb_req).await?
+        } else {
+            self.open_idb(Parameters(idb_req)).await?
+        };
+
+        // Annotate response with sBPF-specific fields.
+        if let Some(text) = result.content.first_mut().and_then(|c| {
+            if let rmcp::model::RawContent::Text(ref mut t) = c.raw {
+                Some(t)
+            } else {
+                None
+            }
+        }) {
+            if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&text.text) {
+                if let Some(map) = val.as_object_mut() {
+                    map.insert("sbpf_source".to_string(), json!(req.path));
+                    map.insert("dylib_path".to_string(), json!(dylib_str));
+                    map.insert("compiled".to_string(), json!(compiled));
+                }
+                text.text =
+                    serde_json::to_string_pretty(&val).unwrap_or_else(|_| text.text.clone());
+            }
+        }
+
+        Ok(result)
+    }
+
+    #[tool(
         description = "Load external debug info (e.g., DWARF/dSYM) into the current database. \
         If path is omitted, attempts to locate a sibling .dSYM for the currently-open database."
     )]
@@ -4218,6 +4330,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         // Core
         "open_idb" => Some(schema::<OpenIdbRequest>()),
         "open_dsc" => Some(schema::<OpenDscRequest>()),
+        "open_sbpf" => Some(schema::<OpenSbpfRequest>()),
         "dsc_add_dylib" => Some(schema::<DscAddDylibRequest>()),
         "close_idb" => Some(schema::<CloseIdbRequest>()),
         "load_debug_info" => Some(schema::<LoadDebugInfoRequest>()),

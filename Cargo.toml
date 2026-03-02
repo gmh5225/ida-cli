@@ -9,6 +9,13 @@ authors = ["pingzi"]
 keywords = ["ida", "mcp", "reverse-engineering", "disassembly", "decompiler"]
 categories = ["development-tools", "command-line-utilities"]
 
+[lib]
+name = "ida_mcp"
+
+[[bin]]
+name = "ida-mcp"
+path = "src/main.rs"
+
 [dependencies]
 idalib = { path = "3rd-github/idalib/idalib" }
 rmcp = { version = "0.15", features = ["server", "transport-io", "transport-streamable-http-server"] }

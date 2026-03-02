@@ -80,6 +80,7 @@ use std::path::PathBuf;
 
 pub mod disasm;
 pub mod dsc;
+pub mod sbpf;
 pub mod error;
 pub mod ida;
 pub mod router;

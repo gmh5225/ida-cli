@@ -1081,6 +1081,25 @@ pub struct OpenDscRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct OpenSbpfRequest {
+    #[schemars(
+        description = "Path to the Solana sBPF .so program. sbpf2host will AOT-compile it to a \
+        host-native shared library (.dylib on macOS) which IDA opens with full Hex-Rays support."
+    )]
+    pub path: String,
+    #[schemars(
+        description = "Output directory for the compiled .dylib (default: same directory as input .so)."
+    )]
+    pub output_dir: Option<String>,
+    #[schemars(
+        description = "Explicit path to the sbpf2host binary. If omitted, searches PATH and ~/.cargo/bin."
+    )]
+    pub sbpf2host_path: Option<String>,
+    #[schemars(description = "Pass --dump-ir to sbpf2host to also emit LLVM IR (default: false)")]
+    pub dump_ir: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct DscAddDylibRequest {
     #[schemars(
         description = "Optional database handle for multi-IDB routing. If omitted, uses the active database."
