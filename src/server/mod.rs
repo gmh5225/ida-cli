@@ -877,7 +877,7 @@ impl IdaMcpServer {
         // Detection: entrypoint callgraph depth=2, exactly 2 direct callees,
         // the one with more sub-callees is process_instruction.
         // If the pattern doesn't match, we don't guess — return None.
-        let process_instruction_json: Option<serde_json::Value> = 'pi: {
+        let mut process_instruction_json: Option<serde_json::Value> = 'pi: {
             let ep_addr = entrypoint_json
                 .as_ref()
                 .and_then(|ep| ep.get("address"))
@@ -1005,6 +1005,44 @@ impl IdaMcpServer {
             }
         };
 
+        // Rename the detected process_instruction in IDA for convenience.
+        // Update the JSON name field to reflect the rename.
+        if let Some(ref mut pi) = process_instruction_json {
+            if let Some(pi_addr_str) = pi.get("address").and_then(|v| v.as_str()).map(String::from) {
+                let current_name = pi.get("name").and_then(|v| v.as_str()).map(String::from);
+                let renamed = if let Some(ref handle) = db_handle {
+                    if let ServerMode::Router(ref router) = self.mode {
+                        self.route_or_err(
+                            router,
+                            Some(handle),
+                            "rename",
+                            json!({
+                                "address": pi_addr_str,
+                                "new_name": "process_instruction",
+                            }),
+                        )
+                        .await
+                        .is_ok()
+                    } else if let Some(addr) =
+                        u64::from_str_radix(pi_addr_str.trim_start_matches("0x"), 16).ok()
+                    {
+                        self.worker
+                            .rename(Some(addr), current_name, "process_instruction".into(), 0)
+                            .await
+                            .is_ok()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if renamed {
+                    if let Some(map) = pi.as_object_mut() {
+                        map.insert("name".to_string(), json!("process_instruction"));
+                    }
+                }
+            }
+        }
         // Annotate response with sBPF-specific fields.
         if let Some(text) = result.content.first_mut().and_then(|c| {
             if let rmcp::model::RawContent::Text(ref mut t) = c.raw {
