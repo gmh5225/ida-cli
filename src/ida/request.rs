@@ -381,6 +381,11 @@ pub enum IdaRequest {
         end_addr: Option<u64>,
         resp: oneshot::Sender<Result<Value, ToolError>>,
     },
+    SearchPseudocode {
+        pattern: String,
+        limit: usize,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
     RunScript {
         code: String,
         resp: oneshot::Sender<Result<Value, ToolError>>,
@@ -518,6 +523,7 @@ impl_request_inspection!(
     XrefMatrix,
     ExportFuncs,
     PseudocodeAt,
+    SearchPseudocode,
     RunScript,
     RenameLvar,
     SetLvarType,

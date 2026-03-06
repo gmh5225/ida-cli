@@ -1151,6 +1151,37 @@ pub fn run_ida_loop(rx: mpsc::Receiver<EnqueuedRequest>) {
                 }
                 let _ = resp.send(result);
             }
+            IdaRequest::SearchPseudocode {
+                pattern,
+                limit,
+                resp,
+            } => {
+                debug!(pattern = %pattern, limit, "Searching pseudocode");
+                let started = std::time::Instant::now();
+                let result = disasm::handle_search_pseudocode(&idb, &pattern, limit);
+                let elapsed_ms = started.elapsed().as_millis();
+                match &result {
+                    Ok(value) => {
+                        let match_count = value
+                            .get("matches")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0);
+                        let total = value
+                            .get("total_searched")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        info!(
+                            elapsed_ms,
+                            match_count,
+                            total_searched = total,
+                            "Pseudocode search complete"
+                        );
+                    }
+                    Err(e) => warn!(elapsed_ms, error = %e, "Pseudocode search failed"),
+                }
+                let _ = resp.send(result);
+            }
             IdaRequest::RunScript { code, resp } => {
                 debug!(code_len = code.len(), "Running script");
                 let started = std::time::Instant::now();

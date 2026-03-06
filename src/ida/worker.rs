@@ -1190,7 +1190,21 @@ impl IdaWorker {
         rx.await?
     }
 
-    /// Run a Python script via IDAPython in the open database.
+    pub async fn search_pseudocode(
+        &self,
+        pattern: &str,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::SearchPseudocode {
+            pattern: pattern.to_string(),
+            limit,
+            resp: tx,
+        })?;
+        Self::recv_with_timeout(rx, timeout_secs).await
+    }
+
     pub async fn run_script(
         &self,
         code: &str,
@@ -1810,6 +1824,15 @@ impl WorkerDispatch for IdaWorker {
     ) -> Result<Value, ToolError> {
         self.find_insn_operands(patterns, max_results, case_insensitive, timeout_secs)
             .await
+    }
+
+    async fn search_pseudocode(
+        &self,
+        pattern: &str,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        self.search_pseudocode(pattern, limit, timeout_secs).await
     }
 
     async fn run_script(&self, code: &str, timeout_secs: Option<u64>) -> Result<Value, ToolError> {

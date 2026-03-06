@@ -1049,6 +1049,103 @@ impl IdaMcpServer {
                 }
             }
         }
+
+        // Import sbpf_runtime.h types (only once per database)
+        let runtime_types_result: Option<serde_json::Value> = 'import_types: {
+            if req.skip_runtime_types {
+                info!("Skipping sbpf_runtime.h types import (skip_runtime_types=true)");
+                break 'import_types None;
+            }
+
+            // Check if SbpfContext type already exists
+            let already_imported = if let Some(ref handle) = db_handle {
+                if let ServerMode::Router(ref router) = self.mode {
+                    match self
+                        .route_or_err(
+                            router,
+                            Some(handle),
+                            "local_types",
+                            json!({"filter": "SbpfContext", "limit": 1}),
+                        )
+                        .await
+                    {
+                        Ok(r) if !r.is_error.unwrap_or(false) => r
+                            .content
+                            .first()
+                            .and_then(|c| match &c.raw {
+                                rmcp::model::RawContent::Text(t) => {
+                                    serde_json::from_str::<serde_json::Value>(&t.text).ok()
+                                }
+                                _ => None,
+                            })
+                            .and_then(|v| v.get("total")?.as_u64())
+                            .map(|n| n > 0)
+                            .unwrap_or(false),
+                        _ => false,
+                    }
+                } else {
+                    self.worker
+                        .local_types(0, 1, Some("SbpfContext".to_string()), None)
+                        .await
+                        .map(|r| r.total > 0)
+                        .unwrap_or(false)
+                }
+            } else {
+                false
+            };
+
+            if already_imported {
+                info!("sbpf_runtime.h types already imported, skipping");
+                break 'import_types Some(json!({
+                    "imported": false,
+                    "reason": "already_exists"
+                }));
+            }
+
+            // Read header file from bundled assets
+            let header_content = include_str!("../../assets/sbpf/sbpf_runtime.h");
+
+            // Import types using declare_type with multi=true
+            let import_ok = if let Some(ref handle) = db_handle {
+                if let ServerMode::Router(ref router) = self.mode {
+                    self.route_or_err(
+                        router,
+                        Some(handle),
+                        "declare_types",
+                        json!({
+                            "decl": header_content,
+                            "relaxed": true,
+                            "multi": true
+                        }),
+                    )
+                    .await
+                    .is_ok()
+                } else {
+                    self.worker
+                        .declare_type(header_content.to_string(), true, false, true)
+                        .await
+                        .is_ok()
+                }
+            } else {
+                false
+            };
+
+            if import_ok {
+                info!("sbpf_runtime.h types imported successfully");
+                Some(json!({
+                    "imported": true,
+                    "types": ["SbpfContext", "SolBytes", "RuntimeConfigFFI", "ExecContext"],
+                    "hint": "Use set_function_prototype to apply these types to sol_* syscalls. Example: set_function_prototype(address='sol_log_', prototype='void sol_log_(const SbpfContext *ctx, const uint8_t *msg, uint64_t len)')"
+                }))
+            } else {
+                warn!("Failed to import sbpf_runtime.h types");
+                Some(json!({
+                    "imported": false,
+                    "reason": "declare_types_failed"
+                }))
+            }
+        };
+
         // Annotate response with sBPF-specific fields.
         if let Some(text) = result.content.first_mut().and_then(|c| {
             if let rmcp::model::RawContent::Text(ref mut t) = c.raw {
@@ -1067,6 +1164,9 @@ impl IdaMcpServer {
                     }
                     if let Some(pi) = process_instruction_json {
                         map.insert("process_instruction".to_string(), pi);
+                    }
+                    if let Some(rt) = runtime_types_result {
+                        map.insert("runtime_types".to_string(), rt);
                     }
                 }
                 text.text =
@@ -1633,7 +1733,31 @@ impl IdaMcpServer {
 
         if addrs.len() == 1 {
             match self.worker.decompile(addrs[0]).await {
-                Ok(code) => Ok(CallToolResult::success(vec![Content::text(code)])),
+                Ok(code) => {
+                    // Detect IDA auto-generated unknown function names (sub_XXXX, nullsub_X, j_sub_XXXX).
+                    // Only check the first line (the function signature) to avoid false positives
+                    // from callee references inside the function body.
+                    let has_unknown_name = code
+                        .lines()
+                        .next()
+                        .map(|sig| {
+                            sig.contains("sub_")
+                                || sig.contains("nullsub_")
+                                || sig.contains("j_sub_")
+                        })
+                        .unwrap_or(false);
+                    let output = if has_unknown_name {
+                        format!(
+                            "💡 If you understand this function's purpose, \
+                             immediately call rename_symbol to rename it before proceeding.\n\n\
+                             {}",
+                            code
+                        )
+                    } else {
+                        code
+                    };
+                    Ok(CallToolResult::success(vec![Content::text(output)]))
+                }
                 Err(e) => Ok(e.to_tool_result()),
             }
         } else {
@@ -1877,36 +2001,14 @@ impl IdaMcpServer {
                 .await;
         }
 
-        let funcs = self
+        let result = self
             .worker
-            .list_functions(0, 10000, None, req.timeout_secs)
+            .search_pseudocode(&req.pattern, limit, req.timeout_secs)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let mut matches = Vec::new();
-        for func in &funcs.functions {
-            if matches.len() >= limit {
-                break;
-            }
-            let addr = u64::from_str_radix(func.address.trim_start_matches("0x"), 16).unwrap_or(0);
-            if let Ok(result) = self.worker.decompile(addr).await {
-                if result.contains(&req.pattern) {
-                    matches.push(json!({
-                        "address": func.address,
-                        "name": func.name,
-                        "pseudocode": result,
-                    }));
-                }
-            }
-        }
-
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&json!({
-                "pattern": req.pattern,
-                "matches": matches,
-                "total_searched": funcs.functions.len(),
-            }))
-            .unwrap_or_default(),
+            serde_json::to_string_pretty(&result).unwrap_or_default(),
         )]))
     }
 

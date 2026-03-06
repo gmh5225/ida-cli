@@ -126,6 +126,56 @@ pub fn handle_decompile(idb: &Option<IDB>, addr: u64) -> Result<String, ToolErro
     Ok(cfunc.pseudocode())
 }
 
+/// Search decompiled pseudocode of all functions for a text pattern.
+/// Runs entirely on the main thread — no cross-thread overhead per function.
+pub fn handle_search_pseudocode(
+    idb: &Option<IDB>,
+    pattern: &str,
+    limit: usize,
+) -> Result<Value, ToolError> {
+    let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+
+    if !db.decompiler_available() {
+        return Err(ToolError::DecompilerUnavailable);
+    }
+
+    let mut matches = Vec::new();
+    let mut total_searched = 0usize;
+    let mut errors = 0usize;
+
+    for (_id, func) in db.functions() {
+        total_searched += 1;
+        let addr = func.start_address();
+        let name = func.name().unwrap_or_else(|| format!("sub_{:x}", addr));
+
+        match db.decompile(&func) {
+            Ok(cfunc) => {
+                let pseudocode = cfunc.pseudocode();
+                if pseudocode.contains(pattern) {
+                    matches.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "name": name,
+                        "pseudocode": pseudocode,
+                    }));
+                    if matches.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            Err(_) => {
+                errors += 1;
+            }
+        }
+    }
+
+    Ok(json!({
+        "pattern": pattern,
+        "matches": matches,
+        "total_searched": total_searched,
+        "decompile_errors": errors,
+    }))
+}
+
 /// Get decompiled pseudocode statements at a specific address or address range.
 pub fn handle_pseudocode_at(
     idb: &Option<IDB>,

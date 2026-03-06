@@ -271,7 +271,29 @@ pub async fn dispatch_rpc<W: WorkerDispatch>(
             let addrs = parse_address_values(&req.address)?;
             if addrs.len() == 1 {
                 let r = worker.decompile(addrs[0]).await?;
-                Ok(json!({"code": r}))
+                let has_unknown_name = r
+                    .lines()
+                    .find(|line| {
+                        let t = line.trim();
+                        !t.is_empty()
+                            && !t.starts_with("//")
+                            && !t.starts_with("/*")
+                            && t.contains('(')
+                    })
+                    .map(|sig| {
+                        sig.contains("sub_") || sig.contains("nullsub_") || sig.contains("j_sub_")
+                    })
+                    .unwrap_or(false);
+                let code = if has_unknown_name {
+                    format!(
+                        "💡 If you understand this function's purpose, \
+                         immediately call rename_symbol to rename it before proceeding.\n\n{}",
+                        r
+                    )
+                } else {
+                    r
+                };
+                Ok(json!({"code": code}))
             } else {
                 let mut results = Vec::new();
                 for addr in addrs {
@@ -903,33 +925,10 @@ pub async fn dispatch_rpc<W: WorkerDispatch>(
 
         "search_pseudocode" => {
             let req: SearchPseudocodeRequest = parse_params(p)?;
-            let pattern = req.pattern;
             let limit = req.limit.unwrap_or(20).min(100);
-            let timeout = req.timeout_secs;
-
-            let funcs = worker.list_functions(0, 10000, None, timeout).await?;
-            let mut matches = Vec::new();
-            for func in &funcs.functions {
-                if matches.len() >= limit {
-                    break;
-                }
-                let addr =
-                    u64::from_str_radix(func.address.trim_start_matches("0x"), 16).unwrap_or(0);
-                if let Ok(result) = worker.decompile(addr).await {
-                    if result.contains(&pattern) {
-                        matches.push(json!({
-                            "address": func.address,
-                            "name": func.name,
-                            "pseudocode": result,
-                        }));
-                    }
-                }
-            }
-            Ok(json!({
-                "pattern": pattern,
-                "matches": matches,
-                "total_searched": funcs.functions.len(),
-            }))
+            worker
+                .search_pseudocode(&req.pattern, limit, req.timeout_secs)
+                .await
         }
 
         "scan_memory_table" => {
@@ -2066,6 +2065,21 @@ pub mod mock {
                 }),
             );
             Ok(json!({}))
+        }
+
+        async fn search_pseudocode(
+            &self,
+            pattern: &str,
+            limit: usize,
+            timeout_secs: Option<u64>,
+        ) -> Result<Value, ToolError> {
+            self.record(
+                "search_pseudocode",
+                json!({"pattern": pattern, "limit": limit, "timeout_secs": timeout_secs}),
+            );
+            Ok(
+                json!({"pattern": pattern, "matches": [], "total_searched": 0, "decompile_errors": 0}),
+            )
         }
 
         async fn run_script(
@@ -3291,7 +3305,7 @@ mod tests {
         )
         .await;
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "list_functions");
+        assert_eq!(calls[0].0, "search_pseudocode");
     }
     #[tokio::test]
     async fn test_dispatch_scan_memory_table() {
@@ -4212,8 +4226,8 @@ mod tests {
     #[case::search_pseudocode(
         "search_pseudocode",
         json!({"pattern": "malloc", "limit": 5, "timeout_secs": 77}),
-        "list_functions",
-        json!({"offset": 0, "limit": 10000, "filter": null, "timeout_secs": 77})
+        "search_pseudocode",
+        json!({"pattern": "malloc", "limit": 5, "timeout_secs": 77})
     )]
     #[tokio::test]
     async fn test_dispatch_full_params_single_call(

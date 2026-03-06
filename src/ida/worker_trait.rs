@@ -453,6 +453,15 @@ pub trait WorkerDispatch {
         timeout_secs: Option<u64>,
     ) -> Result<Value, ToolError>;
 
+    // ── Search ───────────────────────────────────────────────────────────
+
+    async fn search_pseudocode(
+        &self,
+        pattern: &str,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError>;
+
     // ── IDAPython script ────────────────────────────────────────────────
 
     async fn run_script(&self, code: &str, timeout_secs: Option<u64>) -> Result<Value, ToolError>;
