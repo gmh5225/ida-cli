@@ -1,8 +1,9 @@
 //! Solana sBPF AOT compilation support.
 //!
-//! Uses `sbpf2host` to convert a Solana sBPF `.so` binary into a
-//! host-native shared library (`.dylib` on macOS, `.so` on Linux)
-//! that IDA Pro can open with full Hex-Rays decompilation support.
+//! Uses `sbpf-interpreter --llvm-dylib` to convert a Solana sBPF `.so`
+//! binary into a host-native shared library (`.dylib` on macOS, `.so`
+//! on Linux) that IDA Pro can open with full Hex-Rays decompilation
+//! support.
 //!
 //! IDA Pro has no native Hex-Rays decompiler for the sBPF instruction
 //! set. AOT-compiling to the host architecture produces a regular
@@ -16,27 +17,20 @@ use crate::error::ToolError;
 
 // ── Binary discovery ──────────────────────────────────────────────────────
 
-/// Locate the `sbpf2host` binary.
-///
-/// Search order:
-/// 1. `SBPF2HOST` environment variable (explicit path)
-/// 2. `PATH` — `which sbpf2host`
-/// 3. Well-known install locations (`~/.cargo/bin`, `/usr/local/bin`)
 pub fn find_sbpf2host() -> Result<PathBuf, ToolError> {
-    // 1. Explicit environment variable
-    if let Ok(path) = std::env::var("SBPF2HOST") {
-        let p = PathBuf::from(&path);
-        if p.exists() {
-            return Ok(p);
+    for env_key in ["SBPF_INTERPRETER", "SBPF2HOST"] {
+        if let Ok(path) = std::env::var(env_key) {
+            let p = PathBuf::from(&path);
+            if p.exists() {
+                return Ok(p);
+            }
+            return Err(ToolError::InvalidParams(format!(
+                "${env_key} is set to '{path}' but the file does not exist",
+            )));
         }
-        return Err(ToolError::InvalidParams(format!(
-            "$SBPF2HOST is set to '{}' but the file does not exist",
-            path
-        )));
     }
 
-    // 2. PATH lookup
-    if let Ok(output) = Command::new("which").arg("sbpf2host").output() {
+    if let Ok(output) = Command::new("which").arg("sbpf-interpreter").output() {
         if output.status.success() {
             let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !s.is_empty() {
@@ -48,14 +42,11 @@ pub fn find_sbpf2host() -> Result<PathBuf, ToolError> {
         }
     }
 
-    // 3. Well-known locations
     let candidates: &[&str] = &[
-        // Cargo install (most common)
-        "~/.cargo/bin/sbpf2host",
-        "/usr/local/bin/sbpf2host",
-        "/usr/bin/sbpf2host",
-        // Linux workspace builds
-        "~/.local/bin/sbpf2host",
+        "~/.config/opencode/skills/sbpf-trace/bin/sbpf-interpreter",
+        "~/.cargo/bin/sbpf-interpreter",
+        "~/.local/bin/sbpf-interpreter",
+        "/usr/local/bin/sbpf-interpreter",
     ];
     for raw in candidates {
         let expanded = crate::expand_path(raw);
@@ -65,8 +56,8 @@ pub fn find_sbpf2host() -> Result<PathBuf, ToolError> {
     }
 
     Err(ToolError::InvalidParams(
-        "Cannot find sbpf2host. Install it (`cargo install sbpf2host`) or set the \
-         SBPF2HOST environment variable to its path."
+        "Cannot find sbpf-interpreter. Build it with `cargo build --release --features llvm` \
+         or set SBPF_INTERPRETER env var to its path."
             .into(),
     ))
 }
@@ -81,7 +72,7 @@ fn is_dir_writable(dir: &Path) -> bool {
     if !dir.is_dir() {
         return false;
     }
-    let probe = dir.join(format!(".sbpf2host_probe_{}", std::process::id()));
+    let probe = dir.join(format!(".sbpf_compile_probe_{}", std::process::id()));
     match std::fs::File::create(&probe) {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);
@@ -91,7 +82,7 @@ fn is_dir_writable(dir: &Path) -> bool {
     }
 }
 
-/// Resolve the effective output directory for `sbpf2host` products.
+/// Resolve the effective output directory for AOT compilation products.
 ///
 /// - If `output_dir` is explicitly provided, returns it as-is (respecting
 ///   the caller's choice, even if the directory might not be writable).
@@ -111,7 +102,7 @@ pub fn resolve_output_dir(input: &Path, output_dir: Option<&Path>) -> PathBuf {
         tracing::warn!(
             input_dir = %parent.display(),
             fallback = %tmp.display(),
-            "Input directory is not writable; falling back to temp dir for sbpf2host output"
+            "Input directory is not writable; falling back to temp dir for sbpf-interpreter output"
         );
         tmp
     }
@@ -121,13 +112,7 @@ pub fn resolve_output_dir(input: &Path, output_dir: Option<&Path>) -> PathBuf {
 
 /// Compute the output `.dylib` / `.so` path for a given sBPF input.
 ///
-/// If `output_dir` is provided, the output file is placed there.
-/// Otherwise it is placed alongside the input file.
-///
-/// The output extension is platform-specific:
-/// - macOS → `.dylib`
-/// - Linux → `.host.so`  (to avoid colliding with the original `.so`)
-/// - Other → `.dylib`
+/// Platform-specific extension: macOS → `.dylib`, Linux → `.host.so`.
 pub fn sbpf2host_output_path(input: &Path, output_dir: Option<&Path>) -> PathBuf {
     let stem = input
         .file_stem()
@@ -145,10 +130,10 @@ pub fn sbpf2host_output_path(input: &Path, output_dir: Option<&Path>) -> PathBuf
     dir.join(format!("{stem}.{ext}"))
 }
 
-/// Returns the expected `.dSYM` path that `sbpf2host` produces on macOS.
+/// Returns the expected `.dSYM` path alongside the dylib on macOS.
 ///
-/// `sbpf2host` writes `<output>.dSYM` alongside the dylib.  We auto-load
-/// it after opening so IDA gets debug symbols automatically.
+/// If a `.dSYM` bundle exists, we auto-load it after opening so IDA gets
+/// debug symbols automatically.
 pub fn sbpf2host_dsym_path(dylib_path: &Path) -> PathBuf {
     let mut dsym = dylib_path.as_os_str().to_os_string();
     dsym.push(".dSYM");
@@ -167,7 +152,7 @@ pub fn sbpf2host_dsym_path(dylib_path: &Path) -> PathBuf {
 
 // ── Compilation ───────────────────────────────────────────────────────────
 
-/// Result of a successful `sbpf2host` AOT compilation.
+/// Result of a successful AOT compilation.
 pub struct Sbpf2HostResult {
     /// Path to the produced host-native shared library.
     pub dylib_path: PathBuf,
@@ -175,50 +160,42 @@ pub struct Sbpf2HostResult {
     pub has_debug_info: bool,
 }
 
-/// Run `sbpf2host` to AOT-compile a Solana sBPF `.so` to a host-native dylib.
-///
-/// # Arguments
-/// - `input`      — path to the sBPF `.so`
-/// - `output_dir` — optional directory for the output dylib (default: alongside input)
-/// - `dump_ir`    — if true, pass `--dump-ir` to sbpf2host
-///
-/// # Errors
-/// Returns `ToolError::InvalidParams` if sbpf2host is not found or exits non-zero.
 pub fn run_sbpf2host(
     input: &Path,
     output_dir: Option<&Path>,
     dump_ir: bool,
 ) -> Result<Sbpf2HostResult, ToolError> {
-    let sbpf2host = find_sbpf2host()?;
+    let bin = find_sbpf2host()?;
     let dylib_path = sbpf2host_output_path(input, output_dir);
 
     tracing::info!(
         input = %input.display(),
         output = %dylib_path.display(),
-        "Running sbpf2host AOT compilation"
+        "Running sbpf-interpreter AOT compilation"
     );
 
-    // Canonicalize input so it stays valid after we change the working dir.
     let abs_input = std::fs::canonicalize(input).unwrap_or_else(|_| input.to_path_buf());
     let working_dir = dylib_path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir);
 
-    let mut cmd = Command::new(&sbpf2host);
-    let dylib_stem = dylib_path.with_extension("");
-    cmd.arg(&abs_input)
-        .arg(format!("--dylib-output={}", dylib_stem.display()))
+    let mut cmd = Command::new(&bin);
+    cmd.arg("--program")
+        .arg(&abs_input)
+        .arg("--llvm-dylib")
+        .arg(&dylib_path)
         .current_dir(&working_dir);
 
     if dump_ir {
-        cmd.arg("--dump-ir");
+        let ir_path = dylib_path.with_extension("ll");
+        cmd.arg("--llvm-dump-ir").arg(&ir_path);
     }
 
     let output = cmd.output().map_err(|e| {
         ToolError::InvalidParams(format!(
-            "Failed to spawn sbpf2host ({}): {}",
-            sbpf2host.display(),
+            "Failed to spawn sbpf-interpreter ({}): {}",
+            bin.display(),
             e
         ))
     })?;
@@ -227,7 +204,7 @@ pub fn run_sbpf2host(
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         return Err(ToolError::InvalidParams(format!(
-            "sbpf2host failed (exit {})\nstderr: {}\nstdout: {}",
+            "sbpf-interpreter failed (exit {})\nstderr: {}\nstdout: {}",
             output.status.code().unwrap_or(-1),
             stderr.trim(),
             stdout.trim()
@@ -236,7 +213,7 @@ pub fn run_sbpf2host(
 
     if !dylib_path.exists() {
         return Err(ToolError::InvalidParams(format!(
-            "sbpf2host succeeded but output not found: {}",
+            "sbpf-interpreter succeeded but output not found: {}",
             dylib_path.display()
         )));
     }
@@ -247,7 +224,7 @@ pub fn run_sbpf2host(
     tracing::info!(
         output = %dylib_path.display(),
         has_debug_info,
-        "sbpf2host AOT compilation complete"
+        "sbpf-interpreter AOT compilation complete"
     );
 
     Ok(Sbpf2HostResult {
