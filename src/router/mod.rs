@@ -12,8 +12,8 @@ use crate::router::protocol::{RpcRequest, RpcResponse};
 use crate::server::task::{TaskRegistry, TaskState, TaskStatus};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -379,9 +379,7 @@ impl RouterState {
             prewarm_queue: Arc::new(Mutex::new(PrewarmQueueState::default())),
             route_queue: Arc::new(Mutex::new(RouteQueueState::default())),
             task_registry: TaskRegistry::new(),
-            federation_nodes: Arc::new(Mutex::new(
-                crate::federation::load_node_map_from_env(),
-            )),
+            federation_nodes: Arc::new(Mutex::new(crate::federation::load_node_map_from_env())),
             maintenance_started: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -418,9 +416,9 @@ impl RouterState {
         node: crate::federation::FederationNodeConfig,
     ) -> serde_json::Value {
         let mut nodes = self.federation_nodes.lock().await;
-        let mut record = nodes
-            .remove(&node.name)
-            .unwrap_or_else(|| crate::federation::FederationNodeRecord::new(node.clone(), "heartbeat"));
+        let mut record = nodes.remove(&node.name).unwrap_or_else(|| {
+            crate::federation::FederationNodeRecord::new(node.clone(), "heartbeat")
+        });
         record.config = node.clone();
         record.source = "heartbeat".to_string();
         record.touch(crate::server::task::iso_now());
@@ -568,8 +566,11 @@ impl RouterState {
                         .workers
                         .iter()
                         .filter(|(handle, worker)| {
-                            let ref_count =
-                                inner.ref_tokens.get(*handle).map(|set| set.len()).unwrap_or(0);
+                            let ref_count = inner
+                                .ref_tokens
+                                .get(*handle)
+                                .map(|set| set.len())
+                                .unwrap_or(0);
                             ref_count == 0
                                 && worker.pending.is_empty()
                                 && inner.active.as_deref() != Some(handle.as_str())
@@ -737,10 +738,9 @@ impl RouterState {
                         // the process exit was expected — no warning needed.
                         if let Some(dead) = inner.workers.remove(&handle_for_reader) {
                             if let Some(path) = &dead.open_path {
-                                inner.path_to_handle.remove(&Self::worker_key(
-                                    path.clone(),
-                                    &dead.tenant_id,
-                                ));
+                                inner
+                                    .path_to_handle
+                                    .remove(&Self::worker_key(path.clone(), &dead.tenant_id));
                             }
                             // dead.child drops here; kill_on_drop=true handles cleanup
                             if let Some(tokens) = inner.ref_tokens.remove(&handle_for_reader) {
@@ -801,10 +801,9 @@ impl RouterState {
                         }
                         if let Some(dead) = inner.workers.remove(&handle_for_reader) {
                             if let Some(path) = &dead.open_path {
-                                inner.path_to_handle.remove(&Self::worker_key(
-                                    path.clone(),
-                                    &dead.tenant_id,
-                                ));
+                                inner
+                                    .path_to_handle
+                                    .remove(&Self::worker_key(path.clone(), &dead.tenant_id));
                             }
                         }
                         if let Some(tokens) = inner.ref_tokens.remove(&handle_for_reader) {
@@ -944,14 +943,16 @@ impl RouterState {
 
     pub async fn close_worker(&self, handle: &str) -> Result<(), crate::error::ToolError> {
         let mut inner = self.inner.lock().await;
-        self.warm_pool.lock().await.retain(|_, lease| lease.handle != handle);
+        self.warm_pool
+            .lock()
+            .await
+            .retain(|_, lease| lease.handle != handle);
 
         if let Some(mut worker) = inner.workers.remove(handle) {
             if let Some(path) = &worker.open_path {
-                inner.path_to_handle.remove(&Self::worker_key(
-                    path.clone(),
-                    &worker.tenant_id,
-                ));
+                inner
+                    .path_to_handle
+                    .remove(&Self::worker_key(path.clone(), &worker.tenant_id));
             }
             if let Some(tokens) = inner.ref_tokens.remove(handle) {
                 for token in &tokens {
@@ -1416,8 +1417,7 @@ impl RouterState {
         &self,
         path: &str,
     ) -> Result<serde_json::Value, crate::error::ToolError> {
-        self.prewarm_path_with_options(path, false, "default")
-            .await
+        self.prewarm_path_with_options(path, false, "default").await
     }
 
     pub async fn prewarm_path_with_options(
@@ -1535,10 +1535,7 @@ impl RouterState {
         Ok(())
     }
 
-    async fn release_warm_lease(
-        &self,
-        path: &PathBuf,
-    ) -> Result<(), crate::error::ToolError> {
+    async fn release_warm_lease(&self, path: &PathBuf) -> Result<(), crate::error::ToolError> {
         if let Some(lease) = self.warm_pool.lock().await.remove(path) {
             if let Some((handle, remaining)) = self.release_ref_token(&lease.token).await {
                 if remaining == 0 {
@@ -1623,6 +1620,16 @@ impl RouterState {
             Ok(id) => id,
             Err(existing) => existing,
         };
+        self.task_registry.merge_meta(
+            &task_id,
+            serde_json::json!({
+                "tenant_id": tenant_id,
+                "path": path,
+                "method": method,
+                "priority": priority,
+                "remote": false,
+            }),
+        );
 
         if self.task_registry.get(&task_id).is_some() && !queue.active.contains_key(&task_id) {
             queue.queued.push(QueuedRouteTask {
@@ -1667,7 +1674,8 @@ impl RouterState {
 
         let tenant_id = Self::normalize_tenant(tenant_id.as_deref());
         let nodes = self.federation_nodes_snapshot().await;
-        let candidates = crate::federation::choose_ready_nodes(&nodes, Some(method), Some(&tenant_id));
+        let candidates =
+            crate::federation::choose_ready_nodes(&nodes, Some(method), Some(&tenant_id));
         if candidates.is_empty() {
             return Err(ToolError::IdaError(
                 "no ready federation node available".to_string(),
@@ -1682,6 +1690,16 @@ impl RouterState {
             Ok(id) => id,
             Err(existing) => existing,
         };
+        self.task_registry.merge_meta(
+            &task_id,
+            serde_json::json!({
+                "tenant_id": tenant_id,
+                "path": path,
+                "method": method,
+                "priority": priority,
+                "remote": true,
+            }),
+        );
 
         let mut last_error = None;
         let mut chosen = None;
@@ -1711,10 +1729,8 @@ impl RouterState {
                         remote_url = Some(remote.url.clone());
                         break;
                     } else {
-                        last_error = Some(format!(
-                            "remote node {} did not return task_id",
-                            node.name
-                        ));
+                        last_error =
+                            Some(format!("remote node {} did not return task_id", node.name));
                     }
                 }
                 Err(err) => {
@@ -1736,6 +1752,14 @@ impl RouterState {
                 self.task_registry.update_message(
                     &task_id,
                     &format!("Queued remotely on {} as {}", node.name, remote_task_id),
+                );
+                self.task_registry.merge_meta(
+                    &task_id,
+                    serde_json::json!({
+                        "node": node.name,
+                        "url": remote_url.clone().unwrap_or_else(|| node.url.clone()),
+                        "remote_task_id": remote_task_id,
+                    }),
                 );
 
                 let registry = self.task_registry.clone();
@@ -1778,7 +1802,10 @@ impl RouterState {
                                     "failed" => {
                                         registry.fail(
                                             &task_id_for_poll,
-                                            &format!("remote {} failed: {}", remote_node.name, message),
+                                            &format!(
+                                                "remote {} failed: {}",
+                                                remote_node.name, message
+                                            ),
                                         );
                                         break;
                                     }
@@ -1834,7 +1861,8 @@ impl RouterState {
         let mut queue = self.route_queue.lock().await;
         if let Some(idx) = queue.queued.iter().position(|task| task.task_id == task_id) {
             queue.queued.remove(idx);
-            self.task_registry.fail(task_id, "Cancelled before execution");
+            self.task_registry
+                .fail(task_id, "Cancelled before execution");
             return true;
         }
         false
@@ -1857,7 +1885,8 @@ impl RouterState {
                     });
                     pos.map(|idx| {
                         let task = queue.queued.remove(idx);
-                        queue.tenant_active
+                        queue
+                            .tenant_active
                             .entry(task.tenant_id.clone())
                             .and_modify(|count| *count += 1)
                             .or_insert(1);
@@ -1961,8 +1990,9 @@ impl RouterState {
             let state = self.clone();
             tokio::spawn(async move {
                 let result = async {
-                    let (handle, token) =
-                        state.ensure_worker_with_ref(&task.path, Some(&task.tenant_id)).await?;
+                    let (handle, token) = state
+                        .ensure_worker_with_ref(&task.path, Some(&task.tenant_id))
+                        .await?;
                     let value = state
                         .route_request(Some(&handle), &task.method, task.params.clone())
                         .await?;
@@ -2096,6 +2126,7 @@ pub fn task_state_json(state: &TaskState) -> serde_json::Value {
         "message": state.message,
         "created_at": state.created_at_iso,
         "updated_at": state.updated_at_iso,
+        "meta": state.meta,
         "result": state.result,
     });
 
@@ -2261,6 +2292,38 @@ mod tests {
             .route_request(None, "list_functions", serde_json::json!({}))
             .await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_task_state_json_exposes_meta_and_remote_fields() {
+        let now = std::time::Instant::now();
+        let state = TaskState {
+            id: "job-1".to_string(),
+            status: TaskStatus::Completed,
+            message: "Completed".to_string(),
+            meta: Some(serde_json::json!({
+                "tenant_id": "team-a",
+                "path": "/tmp/sample.bin",
+                "method": "list_functions",
+            })),
+            result: Some(serde_json::json!({
+                "remote": true,
+                "node": "node-a",
+                "remote_task_id": "task-9",
+            })),
+            created_at: now,
+            updated_at: now,
+            created_at_iso: "2026-04-17T00:00:00Z".to_string(),
+            updated_at_iso: "2026-04-17T00:00:01Z".to_string(),
+            key: None,
+        };
+
+        let value = task_state_json(&state);
+        assert_eq!(value["meta"]["tenant_id"], "team-a");
+        assert_eq!(value["meta"]["method"], "list_functions");
+        assert_eq!(value["remote"], true);
+        assert_eq!(value["node"], "node-a");
+        assert_eq!(value["remote_task_id"], "task-9");
     }
 
     #[test]

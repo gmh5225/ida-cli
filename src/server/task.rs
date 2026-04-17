@@ -31,6 +31,7 @@ pub struct TaskState {
     pub id: String,
     pub status: TaskStatus,
     pub message: String,
+    pub meta: Option<Value>,
     pub result: Option<Value>,
     pub created_at: Instant,
     pub updated_at: Instant,
@@ -72,6 +73,7 @@ impl TaskRegistry {
         prefix: &str,
         key: Option<&str>,
         message: &str,
+        meta: Option<Value>,
     ) -> Result<String, String> {
         let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -94,6 +96,7 @@ impl TaskRegistry {
             id: id.clone(),
             status: TaskStatus::Running,
             message: message.to_string(),
+            meta,
             result: None,
             created_at: now,
             updated_at: now,
@@ -115,12 +118,12 @@ impl TaskRegistry {
     /// Create a task with a deduplication key. If a running task with
     /// the same key already exists, returns `Err(existing_task_id)`.
     pub fn create_keyed(&self, key: &str, message: &str) -> Result<String, String> {
-        self.create_internal("dsc", Some(key), message)
+        self.create_internal("dsc", Some(key), message, None)
     }
 
     /// Create a generic running task without deduplication.
     pub fn create(&self, prefix: &str, message: &str) -> String {
-        self.create_internal(prefix, None, message)
+        self.create_internal(prefix, None, message, None)
             .expect("unkeyed task creation must succeed")
     }
 
@@ -131,7 +134,17 @@ impl TaskRegistry {
         key: Option<&str>,
         message: &str,
     ) -> Result<String, String> {
-        self.create_internal(prefix, key, message)
+        self.create_internal(prefix, key, message, None)
+    }
+
+    pub fn create_with_meta(
+        &self,
+        prefix: &str,
+        key: Option<&str>,
+        message: &str,
+        meta: Value,
+    ) -> Result<String, String> {
+        self.create_internal(prefix, key, message, Some(meta))
     }
 
     /// Store the `JoinHandle` for a task so it can be cancelled.
@@ -159,6 +172,21 @@ impl TaskRegistry {
         let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = entries.get_mut(id) {
             entry.state.message = message.to_string();
+            refresh_updated(&mut entry.state);
+        }
+    }
+
+    pub fn merge_meta(&self, id: &str, meta_patch: Value) {
+        let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = entries.get_mut(id) {
+            match (&mut entry.state.meta, meta_patch) {
+                (Some(Value::Object(existing)), Value::Object(patch)) => {
+                    for (k, v) in patch {
+                        existing.insert(k, v);
+                    }
+                }
+                (_, patch) => entry.state.meta = Some(patch),
+            }
             refresh_updated(&mut entry.state);
         }
     }
@@ -219,6 +247,7 @@ impl TaskRegistry {
             id: id.clone(),
             status: TaskStatus::Completed,
             message: message.to_string(),
+            meta: None,
             result: Some(result),
             created_at: now,
             updated_at: now,
@@ -425,5 +454,23 @@ mod tests {
             state.created_at_iso
         );
         assert!(state.created_at_iso.ends_with('Z'));
+    }
+
+    #[test]
+    fn create_and_merge_meta() {
+        let registry = TaskRegistry::new();
+        let id = registry
+            .create_with_meta("job", None, "Queued", json!({"tenant_id": "team-a"}))
+            .expect("should succeed");
+        registry.merge_meta(&id, json!({"path": "/tmp/sample.bin", "remote": false}));
+        let state = registry.get(&id).expect("task should exist");
+        assert_eq!(
+            state.meta,
+            Some(json!({
+                "tenant_id": "team-a",
+                "path": "/tmp/sample.bin",
+                "remote": false,
+            }))
+        );
     }
 }
