@@ -192,6 +192,10 @@ where
                         .unwrap_or_else(|_| serde_json::json!({"error": "status serialization failed"}));
                     return Ok(json_response(StatusCode::OK, value));
                 }
+                if path == "/metrics" {
+                    let status = router.status_snapshot().await;
+                    return Ok(metrics_response(&status));
+                }
             }
 
             if let Some(origin) = req.headers().get(ORIGIN).and_then(|v| v.to_str().ok()) {
@@ -220,11 +224,101 @@ where
     }
 }
 
-fn json_response(status: StatusCode, value: serde_json::Value) -> Response<BoxBody<Bytes, std::convert::Infallible>> {
+fn json_response(
+    status: StatusCode,
+    value: serde_json::Value,
+) -> Response<BoxBody<Bytes, std::convert::Infallible>> {
     let body = serde_json::to_vec(&value).unwrap_or_else(|_| b"{\"error\":\"serialization failed\"}".to_vec());
     Response::builder()
         .status(status)
         .header(hyper::http::header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(body)).boxed())
+        .expect("valid response")
+}
+
+fn metrics_response(
+    status: &ida_mcp::router::RouterStatus,
+) -> Response<BoxBody<Bytes, std::convert::Infallible>> {
+    let mut lines = Vec::new();
+    lines.push("# HELP ida_cli_workers Number of live workers".to_string());
+    lines.push("# TYPE ida_cli_workers gauge".to_string());
+    lines.push(format!("ida_cli_workers {}", status.worker_count));
+
+    lines.push("# HELP ida_cli_max_workers Configured worker limit".to_string());
+    lines.push("# TYPE ida_cli_max_workers gauge".to_string());
+    lines.push(format!("ida_cli_max_workers {}", status.max_workers));
+
+    lines.push("# HELP ida_cli_max_pending_per_worker Configured per-worker queue limit".to_string());
+    lines.push("# TYPE ida_cli_max_pending_per_worker gauge".to_string());
+    lines.push(format!(
+        "ida_cli_max_pending_per_worker {}",
+        status.max_pending_per_worker
+    ));
+
+    lines.push("# HELP ida_cli_max_concurrent_spawns Configured concurrent spawn limit".to_string());
+    lines.push("# TYPE ida_cli_max_concurrent_spawns gauge".to_string());
+    lines.push(format!(
+        "ida_cli_max_concurrent_spawns {}",
+        status.max_concurrent_spawns
+    ));
+
+    lines.push("# HELP ida_cli_warm_pool_size Number of warm leased workers".to_string());
+    lines.push("# TYPE ida_cli_warm_pool_size gauge".to_string());
+    lines.push(format!("ida_cli_warm_pool_size {}", status.warm_pool.len()));
+
+    lines.push("# HELP ida_cli_prewarm_queue_depth Number of queued prewarm tasks".to_string());
+    lines.push("# TYPE ida_cli_prewarm_queue_depth gauge".to_string());
+    lines.push(format!(
+        "ida_cli_prewarm_queue_depth {}",
+        status.prewarm_queue.len()
+    ));
+
+    lines.push("# HELP ida_cli_prewarm_active Number of active prewarm tasks".to_string());
+    lines.push("# TYPE ida_cli_prewarm_active gauge".to_string());
+    lines.push(format!(
+        "ida_cli_prewarm_active {}",
+        status.prewarm_active.len()
+    ));
+
+    lines.push("# HELP ida_cli_idb_cache_bytes Size of cached databases in bytes".to_string());
+    lines.push("# TYPE ida_cli_idb_cache_bytes gauge".to_string());
+    lines.push(format!(
+        "ida_cli_idb_cache_bytes {}",
+        status.idb_cache.total_size_bytes
+    ));
+
+    lines.push("# HELP ida_cli_response_cache_bytes Size of cached responses in bytes".to_string());
+    lines.push("# TYPE ida_cli_response_cache_bytes gauge".to_string());
+    lines.push(format!(
+        "ida_cli_response_cache_bytes {}",
+        status.response_cache.total_size_bytes
+    ));
+
+    for (backend, count) in &status.backend_counts {
+        lines.push(format!(
+            "ida_cli_backend_workers{{backend=\"{}\"}} {}",
+            backend, count
+        ));
+    }
+
+    if let Some(runtime_probe) = &status.runtime_probe {
+        let supported = if runtime_probe.supported { 1 } else { 0 };
+        let backend = runtime_probe.backend.map(|b| b.to_string()).unwrap_or_default();
+        let version = runtime_probe
+            .runtime
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        lines.push(format!(
+            "ida_cli_runtime_probe{{backend=\"{}\",version=\"{}\"}} {}",
+            backend, version, supported
+        ));
+    }
+
+    let body = lines.join("\n") + "\n";
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")
         .body(Full::new(Bytes::from(body)).boxed())
         .expect("valid response")
 }
