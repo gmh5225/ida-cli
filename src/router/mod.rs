@@ -322,7 +322,7 @@ pub struct RouterState {
     prewarm_queue: Arc<Mutex<PrewarmQueueState>>,
     route_queue: Arc<Mutex<RouteQueueState>>,
     task_registry: TaskRegistry,
-    federation_nodes: Arc<Mutex<HashMap<String, crate::federation::FederationNodeConfig>>>,
+    federation_nodes: Arc<Mutex<HashMap<String, crate::federation::FederationNodeRecord>>>,
     maintenance_started: Arc<AtomicBool>,
 }
 
@@ -386,7 +386,7 @@ impl RouterState {
         })
     }
 
-    pub async fn federation_nodes_snapshot(&self) -> Vec<crate::federation::FederationNodeConfig> {
+    pub async fn federation_nodes_snapshot(&self) -> Vec<crate::federation::FederationNodeRecord> {
         self.federation_nodes
             .lock()
             .await
@@ -400,10 +400,33 @@ impl RouterState {
         node: crate::federation::FederationNodeConfig,
     ) -> serde_json::Value {
         let mut nodes = self.federation_nodes.lock().await;
-        let replaced = nodes.insert(node.name.clone(), node.clone()).is_some();
+        let replaced = nodes
+            .insert(
+                node.name.clone(),
+                crate::federation::FederationNodeRecord::new(node.clone(), "dynamic"),
+            )
+            .is_some();
         serde_json::json!({
             "ok": true,
             "replaced": replaced,
+            "node": node,
+        })
+    }
+
+    pub async fn heartbeat_federation_node(
+        &self,
+        node: crate::federation::FederationNodeConfig,
+    ) -> serde_json::Value {
+        let mut nodes = self.federation_nodes.lock().await;
+        let mut record = nodes
+            .remove(&node.name)
+            .unwrap_or_else(|| crate::federation::FederationNodeRecord::new(node.clone(), "heartbeat"));
+        record.config = node.clone();
+        record.source = "heartbeat".to_string();
+        record.touch(crate::server::task::iso_now());
+        nodes.insert(node.name.clone(), record);
+        serde_json::json!({
+            "ok": true,
             "node": node,
         })
     }
@@ -1644,7 +1667,7 @@ impl RouterState {
 
         let tenant_id = Self::normalize_tenant(tenant_id.as_deref());
         let nodes = self.federation_nodes_snapshot().await;
-        let candidates = crate::federation::choose_ready_nodes(&nodes);
+        let candidates = crate::federation::choose_ready_nodes(&nodes, Some(method), Some(&tenant_id));
         if candidates.is_empty() {
             return Err(ToolError::IdaError(
                 "no ready federation node available".to_string(),
