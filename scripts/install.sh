@@ -294,22 +294,28 @@ detect_idadir() {
 
   case "\$OS_NAME" in
     Darwin)
-      local app
+      local app candidate=""
       for app in /Applications/IDA\\ Professional*.app "\$HOME"/Applications/IDA\\ Professional*.app; do
         if [[ -d "\$app/Contents/MacOS" ]]; then
-          printf '%s\n' "\$app/Contents/MacOS"
-          return 0
+          candidate="\$app/Contents/MacOS"
         fi
       done
+      if [[ -n "\$candidate" ]]; then
+        printf '%s\n' "\$candidate"
+        return 0
+      fi
       ;;
     Linux)
-      local dir
+      local dir candidate=""
       for dir in "\$HOME"/ida-pro /opt/ida* /opt/ida-pro* /usr/local/ida*; do
         if [[ -d "\$dir" ]]; then
-          printf '%s\n' "\$dir"
-          return 0
+          candidate="\$dir"
         fi
       done
+      if [[ -n "\$candidate" ]]; then
+        printf '%s\n' "\$candidate"
+        return 0
+      fi
       ;;
   esac
 

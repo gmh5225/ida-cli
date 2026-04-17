@@ -67,6 +67,7 @@ Notes:
 - The installer places the launcher in `~/.local/bin/ida-cli` by default.
 - `--add-path` appends that bin directory to your shell rc file.
 - If `IDASDKDIR` / `IDALIB_SDK` is not already set and the script needs a local build, it will clone the open-source `HexRaysSA/ida-sdk` automatically.
+- If you keep multiple IDA installations side by side, export `IDADIR` explicitly before installing or running `ida-cli`.
 
 ### Build from source
 

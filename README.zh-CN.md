@@ -67,6 +67,7 @@ curl -fsSL https://raw.githubusercontent.com/gmh5225/ida-cli/master/scripts/inst
 - 安装器默认把 launcher 放到 `~/.local/bin/ida-cli`
 - `--add-path` 会把这个目录追加到当前 shell 的 rc 文件
 - 如果本地源码构建时没有设置 `IDASDKDIR` / `IDALIB_SDK`，脚本会自动拉取开源 `HexRaysSA/ida-sdk`
+- 如果机器上并存多套 IDA，建议在安装或运行前显式导出 `IDADIR`
 
 ### 从源码构建
 
