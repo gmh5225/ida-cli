@@ -107,7 +107,9 @@ fn format_segment_list(v: &Value) -> String {
 fn format_status(v: &Value) -> String {
     let count = v.get("worker_count").and_then(|v| v.as_u64()).unwrap_or(0);
     let max_workers = v.get("max_workers").and_then(|v| v.as_u64());
+    let max_workers_per_tenant = v.get("max_workers_per_tenant").and_then(|v| v.as_u64());
     let max_pending = v.get("max_pending_per_worker").and_then(|v| v.as_u64());
+    let max_pending_per_tenant = v.get("max_pending_per_tenant").and_then(|v| v.as_u64());
     let max_spawns = v.get("max_concurrent_spawns").and_then(|v| v.as_u64());
     let active = v.get("active_handle").and_then(|v| v.as_str()).unwrap_or("-");
 
@@ -115,8 +117,18 @@ fn format_status(v: &Value) -> String {
     if let Some(max_workers) = max_workers {
         lines.push(format!("max_workers: {max_workers}"));
     }
+    if let Some(max_workers_per_tenant) = max_workers_per_tenant {
+        lines.push(format!(
+            "max_workers_per_tenant: {max_workers_per_tenant}"
+        ));
+    }
     if let Some(max_pending) = max_pending {
         lines.push(format!("max_pending_per_worker: {max_pending}"));
+    }
+    if let Some(max_pending_per_tenant) = max_pending_per_tenant {
+        lines.push(format!(
+            "max_pending_per_tenant: {max_pending_per_tenant}"
+        ));
     }
     if let Some(max_spawns) = max_spawns {
         lines.push(format!("max_concurrent_spawns: {max_spawns}"));
@@ -163,6 +175,10 @@ fn format_status(v: &Value) -> String {
                     .get("backend")
                     .and_then(|v| v.as_str())
                     .unwrap_or("?");
+                let tenant = worker
+                    .get("tenant_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default");
                 let pending = worker
                     .get("pending_requests")
                     .and_then(|v| v.as_u64())
@@ -174,7 +190,7 @@ fn format_status(v: &Value) -> String {
                     .and_then(|v| v.as_str())
                     .unwrap_or("-");
                 lines.push(format!(
-                    "  {handle} backend={backend} pending={pending} refs={refs} idle={idle}s path={path}"
+                    "  {handle} backend={backend} tenant={tenant} pending={pending} refs={refs} idle={idle}s path={path}"
                 ));
             }
         }

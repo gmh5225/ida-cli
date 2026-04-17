@@ -44,7 +44,9 @@ pub struct WorkerProcess {
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
     pub max_workers: usize,
+    pub max_workers_per_tenant: usize,
     pub max_pending_per_worker: usize,
+    pub max_pending_per_tenant: usize,
     pub max_concurrent_spawns: usize,
     pub max_warm_workers: usize,
     pub max_queued_prewarms: usize,
@@ -71,6 +73,16 @@ impl RouterConfig {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(64);
+        let max_workers_per_tenant = std::env::var("IDA_CLI_MAX_WORKERS_PER_TENANT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or((default_max_workers / 4).max(4));
+        let max_pending_per_tenant = std::env::var("IDA_CLI_MAX_PENDING_PER_TENANT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(512);
         let max_concurrent_spawns = std::env::var("IDA_CLI_MAX_CONCURRENT_SPAWNS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -114,7 +126,9 @@ impl RouterConfig {
 
         Self {
             max_workers,
+            max_workers_per_tenant,
             max_pending_per_worker,
+            max_pending_per_tenant,
             max_concurrent_spawns,
             max_warm_workers,
             max_queued_prewarms,
@@ -206,7 +220,9 @@ pub struct RouterStatus {
     pub worker_count: usize,
     pub active_handle: Option<String>,
     pub max_workers: usize,
+    pub max_workers_per_tenant: usize,
     pub max_pending_per_worker: usize,
+    pub max_pending_per_tenant: usize,
     pub max_concurrent_spawns: usize,
     pub max_warm_workers: usize,
     pub max_queued_prewarms: usize,
@@ -217,6 +233,8 @@ pub struct RouterStatus {
     pub node_id: String,
     pub runtime_probe: Option<RuntimeProbeResult>,
     pub backend_counts: HashMap<String, usize>,
+    pub tenant_worker_counts: HashMap<String, usize>,
+    pub tenant_pending_counts: HashMap<String, usize>,
     pub workers: Vec<WorkerStatus>,
     pub warm_pool: Vec<WarmLeaseStatus>,
     pub prewarm_queue: Vec<PrewarmTaskStatus>,
@@ -447,6 +465,18 @@ impl RouterState {
         }
 
         let mut inner = self.inner.lock().await;
+        let tenant_worker_count = inner
+            .workers
+            .values()
+            .filter(|worker| worker.tenant_id == tenant_id)
+            .count();
+        if tenant_worker_count >= self.config.max_workers_per_tenant {
+            return Err(anyhow::anyhow!(
+                "tenant worker limit reached ({}) for tenant {}",
+                self.config.max_workers_per_tenant,
+                tenant_id
+            ));
+        }
         if inner.workers.len() >= self.config.max_workers {
             return Err(anyhow::anyhow!(
                 "worker limit reached ({}) and no idle worker was evictable",
@@ -725,6 +755,23 @@ impl RouterState {
 
         {
             let mut inner = self.inner.lock().await;
+            let tenant_id = inner
+                .workers
+                .get(&target_handle)
+                .map(|worker| worker.tenant_id.clone())
+                .ok_or_else(|| {
+                    ToolError::InvalidParams(format!("Worker {} not found", target_handle))
+                })?;
+            let tenant_pending = inner
+                .workers
+                .values()
+                .filter(|candidate| candidate.tenant_id == tenant_id)
+                .map(|candidate| candidate.pending.len())
+                .sum::<usize>();
+            if tenant_pending >= self.config.max_pending_per_tenant {
+                return Err(ToolError::Busy);
+            }
+
             let worker = inner.workers.get_mut(&target_handle).ok_or_else(|| {
                 ToolError::InvalidParams(format!("Worker {} not found", target_handle))
             })?;
@@ -844,12 +891,20 @@ impl RouterState {
         };
         let inner = self.inner.lock().await;
         let mut backend_counts: HashMap<String, usize> = HashMap::new();
+        let mut tenant_worker_counts: HashMap<String, usize> = HashMap::new();
+        let mut tenant_pending_counts: HashMap<String, usize> = HashMap::new();
         let workers = inner
             .workers
             .iter()
             .map(|(handle, worker)| {
                 let backend_name = worker.backend.to_string();
                 *backend_counts.entry(backend_name.clone()).or_default() += 1;
+                *tenant_worker_counts
+                    .entry(worker.tenant_id.clone())
+                    .or_default() += 1;
+                *tenant_pending_counts
+                    .entry(worker.tenant_id.clone())
+                    .or_default() += worker.pending.len();
                 WorkerStatus {
                     handle: handle.clone(),
                     backend: backend_name,
@@ -913,7 +968,9 @@ impl RouterState {
             worker_count: inner.workers.len(),
             active_handle: inner.active.clone(),
             max_workers: self.config.max_workers,
+            max_workers_per_tenant: self.config.max_workers_per_tenant,
             max_pending_per_worker: self.config.max_pending_per_worker,
+            max_pending_per_tenant: self.config.max_pending_per_tenant,
             max_concurrent_spawns: self.config.max_concurrent_spawns,
             max_warm_workers: self.config.max_warm_workers,
             max_queued_prewarms: self.config.max_queued_prewarms,
@@ -924,6 +981,8 @@ impl RouterState {
             node_id: self.config.node_id.clone(),
             runtime_probe,
             backend_counts,
+            tenant_worker_counts,
+            tenant_pending_counts,
             workers,
             warm_pool,
             prewarm_queue,

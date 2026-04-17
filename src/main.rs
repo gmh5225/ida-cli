@@ -255,6 +255,20 @@ fn metrics_response(
         status.max_pending_per_worker
     ));
 
+    lines.push("# HELP ida_cli_max_workers_per_tenant Configured per-tenant worker limit".to_string());
+    lines.push("# TYPE ida_cli_max_workers_per_tenant gauge".to_string());
+    lines.push(format!(
+        "ida_cli_max_workers_per_tenant {}",
+        status.max_workers_per_tenant
+    ));
+
+    lines.push("# HELP ida_cli_max_pending_per_tenant Configured per-tenant pending limit".to_string());
+    lines.push("# TYPE ida_cli_max_pending_per_tenant gauge".to_string());
+    lines.push(format!(
+        "ida_cli_max_pending_per_tenant {}",
+        status.max_pending_per_tenant
+    ));
+
     lines.push("# HELP ida_cli_max_concurrent_spawns Configured concurrent spawn limit".to_string());
     lines.push("# TYPE ida_cli_max_concurrent_spawns gauge".to_string());
     lines.push(format!(
@@ -298,6 +312,20 @@ fn metrics_response(
         lines.push(format!(
             "ida_cli_backend_workers{{backend=\"{}\"}} {}",
             backend, count
+        ));
+    }
+
+    for (tenant, count) in &status.tenant_worker_counts {
+        lines.push(format!(
+            "ida_cli_tenant_workers{{tenant=\"{}\"}} {}",
+            tenant, count
+        ));
+    }
+
+    for (tenant, count) in &status.tenant_pending_counts {
+        lines.push(format!(
+            "ida_cli_tenant_pending{{tenant=\"{}\"}} {}",
+            tenant, count
         ));
     }
 
