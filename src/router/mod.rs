@@ -950,7 +950,7 @@ impl RouterState {
         inner.workers.len()
     }
 
-    pub async fn status_snapshot(&self) -> RouterStatus {
+    async fn status_snapshot_inner(&self, include_federation: bool) -> RouterStatus {
         let runtime_probe = match self.cached_probe.lock().await.clone() {
             Some(probe) => Some(probe),
             None => {
@@ -1107,10 +1107,20 @@ impl RouterState {
             recent_tasks,
             idb_cache: crate::idb_store::IdbStore::new().stats(),
             response_cache: crate::server::response_cache::stats(),
-            federation_nodes: crate::federation::probe_nodes(
-                &crate::federation::load_nodes_from_env(),
-            ),
+            federation_nodes: if include_federation {
+                crate::federation::probe_nodes(&crate::federation::load_nodes_from_env())
+            } else {
+                Vec::new()
+            },
         }
+    }
+
+    pub async fn status_snapshot(&self) -> RouterStatus {
+        self.status_snapshot_inner(false).await
+    }
+
+    pub async fn status_snapshot_federated(&self) -> RouterStatus {
+        self.status_snapshot_inner(true).await
     }
 
     pub async fn shutdown_all(&self) {

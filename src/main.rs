@@ -188,7 +188,7 @@ where
                     ));
                 }
                 if path == "/statusz" {
-                    let status = router.status_snapshot().await;
+                    let status = router.status_snapshot_federated().await;
                     let value = serde_json::to_value(status)
                         .unwrap_or_else(|_| serde_json::json!({"error": "status serialization failed"}));
                     return Ok(json_response(StatusCode::OK, value));
