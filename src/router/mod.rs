@@ -24,8 +24,15 @@ use tracing::{debug, error, info, warn};
 pub type DbHandle = String;
 pub type ReqId = String;
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct WorkerKey {
+    tenant_id: String,
+    path: PathBuf,
+}
+
 pub struct WorkerProcess {
     pub backend: WorkerBackendKind,
+    pub tenant_id: String,
     pub child: Child,
     pub writer: BufWriter<ChildStdin>,
     pub pending: HashMap<ReqId, oneshot::Sender<Result<serde_json::Value, String>>>,
@@ -185,6 +192,7 @@ pub struct PrewarmTaskStatus {
 pub struct WorkerStatus {
     pub handle: String,
     pub backend: String,
+    pub tenant_id: String,
     pub pid: Option<u32>,
     pub open_path: Option<String>,
     pub pending_requests: usize,
@@ -238,7 +246,7 @@ impl std::fmt::Debug for RouterState {
 struct RouterInner {
     workers: HashMap<DbHandle, WorkerProcess>,
     active: Option<DbHandle>,
-    path_to_handle: HashMap<PathBuf, DbHandle>,
+    path_to_handle: HashMap<WorkerKey, DbHandle>,
     token_to_handle: HashMap<String, DbHandle>,
     ref_tokens: HashMap<DbHandle, HashSet<String>>,
     req_counter: u64,
@@ -246,6 +254,21 @@ struct RouterInner {
 }
 
 impl RouterState {
+    fn normalize_tenant(tenant_id: Option<&str>) -> String {
+        tenant_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("default")
+            .to_string()
+    }
+
+    fn worker_key(path: PathBuf, tenant_id: &str) -> WorkerKey {
+        WorkerKey {
+            tenant_id: tenant_id.to_string(),
+            path,
+        }
+    }
+
     pub fn new() -> anyhow::Result<Self> {
         let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ida-cli"));
         let config = Arc::new(RouterConfig::from_env());
@@ -322,16 +345,19 @@ impl RouterState {
     pub async fn spawn_worker(
         &self,
         path: &str,
+        tenant_id: Option<&str>,
     ) -> Result<(DbHandle, Option<String>), anyhow::Error> {
         let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+        let tenant_id = Self::normalize_tenant(tenant_id);
+        let worker_key = Self::worker_key(canonical_path.clone(), &tenant_id);
 
         let exe_path = {
             let mut inner = self.inner.lock().await;
 
-            if let Some(existing_handle) = inner.path_to_handle.get(&canonical_path).cloned() {
+            if let Some(existing_handle) = inner.path_to_handle.get(&worker_key).cloned() {
                 info!(
-                    "Path {:?} already open with handle {}, issuing new ref token",
-                    canonical_path, existing_handle
+                    "Tenant {} path {:?} already open with handle {}, issuing new ref token",
+                    tenant_id, canonical_path, existing_handle
                 );
                 let now = {
                     use std::time::{SystemTime, UNIX_EPOCH};
@@ -427,10 +453,10 @@ impl RouterState {
                 self.config.max_workers
             ));
         }
-        if let Some(existing_handle) = inner.path_to_handle.get(&canonical_path).cloned() {
+        if let Some(existing_handle) = inner.path_to_handle.get(&worker_key).cloned() {
             info!(
-                "Path {:?} became active while probing backend; reusing handle {}",
-                canonical_path, existing_handle
+                "Tenant {} path {:?} became active while probing backend; reusing handle {}",
+                tenant_id, canonical_path, existing_handle
             );
             let now = {
                 use std::time::{SystemTime, UNIX_EPOCH};
@@ -510,6 +536,7 @@ impl RouterState {
 
         let worker = WorkerProcess {
             backend,
+            tenant_id: tenant_id.clone(),
             child,
             writer,
             pending: HashMap::new(),
@@ -550,7 +577,10 @@ impl RouterState {
                         // the process exit was expected — no warning needed.
                         if let Some(dead) = inner.workers.remove(&handle_for_reader) {
                             if let Some(path) = &dead.open_path {
-                                inner.path_to_handle.remove(path);
+                                inner.path_to_handle.remove(&Self::worker_key(
+                                    path.clone(),
+                                    &dead.tenant_id,
+                                ));
                             }
                             // dead.child drops here; kill_on_drop=true handles cleanup
                             if let Some(tokens) = inner.ref_tokens.remove(&handle_for_reader) {
@@ -611,7 +641,10 @@ impl RouterState {
                         }
                         if let Some(dead) = inner.workers.remove(&handle_for_reader) {
                             if let Some(path) = &dead.open_path {
-                                inner.path_to_handle.remove(path);
+                                inner.path_to_handle.remove(&Self::worker_key(
+                                    path.clone(),
+                                    &dead.tenant_id,
+                                ));
                             }
                         }
                         if let Some(tokens) = inner.ref_tokens.remove(&handle_for_reader) {
@@ -632,7 +665,7 @@ impl RouterState {
             }
         });
 
-        inner.path_to_handle.insert(canonical_path, handle.clone());
+        inner.path_to_handle.insert(worker_key, handle.clone());
         inner
             .token_to_handle
             .insert(close_token.clone(), handle.clone());
@@ -738,7 +771,10 @@ impl RouterState {
 
         if let Some(mut worker) = inner.workers.remove(handle) {
             if let Some(path) = &worker.open_path {
-                inner.path_to_handle.remove(path);
+                inner.path_to_handle.remove(&Self::worker_key(
+                    path.clone(),
+                    &worker.tenant_id,
+                ));
             }
             if let Some(tokens) = inner.ref_tokens.remove(handle) {
                 for token in &tokens {
@@ -817,6 +853,7 @@ impl RouterState {
                 WorkerStatus {
                     handle: handle.clone(),
                     backend: backend_name,
+                    tenant_id: worker.tenant_id.clone(),
                     pid: worker.child.id(),
                     open_path: worker.open_path.as_ref().map(|p| p.display().to_string()),
                     pending_requests: worker.pending.len(),
@@ -933,16 +970,19 @@ impl RouterState {
     pub async fn ensure_worker_with_ref(
         &self,
         path: &str,
+        tenant_id: Option<&str>,
     ) -> Result<(DbHandle, String), crate::error::ToolError> {
-        self.ensure_worker_with_ref_idb(path, None).await
+        self.ensure_worker_with_ref_idb(path, None, tenant_id).await
     }
 
     pub async fn ensure_worker_with_ref_idb(
         &self,
         path: &str,
         explicit_idb_output: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<(DbHandle, String), crate::error::ToolError> {
         use crate::error::ToolError;
+        let tenant_id = Self::normalize_tenant(tenant_id);
 
         // Resolve sBPF .so → host-native dylib/i64 path for IDA.
         let resolved = resolve_open_path(path);
@@ -952,10 +992,11 @@ impl RouterState {
             std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
         let canonical_open = std::fs::canonicalize(open_path)
             .unwrap_or_else(|_| std::path::PathBuf::from(open_path));
+        let worker_key = Self::worker_key(canonical.clone(), &tenant_id);
 
         let handle = {
             let mut inner = self.inner.lock().await;
-            if let Some(h) = inner.path_to_handle.get(&canonical).cloned() {
+            if let Some(h) = inner.path_to_handle.get(&worker_key).cloned() {
                 if let Some(worker) = inner.workers.get_mut(&h) {
                     worker.last_active = Instant::now();
                 }
@@ -969,7 +1010,7 @@ impl RouterState {
             h
         } else {
             let (h, initial_token) = self
-                .spawn_worker(path)
+                .spawn_worker(path, Some(&tenant_id))
                 .await
                 .map_err(|e| ToolError::IdaError(format!("spawn_worker failed: {e}")))?;
 
@@ -1101,10 +1142,15 @@ impl RouterState {
     pub async fn close_by_path(
         &self,
         path: &std::path::Path,
+        tenant_id: Option<&str>,
     ) -> Result<(), crate::error::ToolError> {
+        let tenant_id = Self::normalize_tenant(tenant_id);
         let handle = {
             let inner = self.inner.lock().await;
-            inner.path_to_handle.get(path).cloned()
+            inner
+                .path_to_handle
+                .get(&Self::worker_key(path.to_path_buf(), &tenant_id))
+                .cloned()
         };
         if let Some(h) = handle {
             let _ = self
@@ -1144,15 +1190,18 @@ impl RouterState {
         }
 
         let canonical = std::fs::canonicalize(&expanded).unwrap_or_else(|_| expanded.clone());
+        let tenant_id = Self::normalize_tenant(Some(tenant_id));
         let already_open = {
             let inner = self.inner.lock().await;
-            inner.path_to_handle.contains_key(&canonical)
+            inner
+                .path_to_handle
+                .contains_key(&Self::worker_key(canonical.clone(), &tenant_id))
         };
 
         let store = crate::idb_store::IdbStore::new();
         let cached_before = store.lookup(&canonical).map(|p| p.display().to_string());
 
-        let (handle, ref_token) = self.ensure_worker_with_ref(path).await?;
+        let (handle, ref_token) = self.ensure_worker_with_ref(path, Some(&tenant_id)).await?;
         let backend = {
             let inner = self.inner.lock().await;
             inner
@@ -1184,7 +1233,7 @@ impl RouterState {
         } else if !already_open {
             if let Some((_, remaining)) = self.release_ref_token(&ref_token).await {
                 if remaining == 0 {
-                    self.close_by_path(&canonical).await?;
+                    self.close_by_path(&canonical, Some(&tenant_id)).await?;
                     closed_worker = true;
                 }
             }

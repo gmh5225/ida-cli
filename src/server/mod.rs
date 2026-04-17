@@ -590,7 +590,7 @@ impl IdaMcpServer {
         let expanded = crate::expand_path(&req.path);
         let is_sbpf = crate::router::is_sbpf_elf(&expanded);
 
-        let (db_handle, close_token) = match router.spawn_worker(&req.path).await {
+        let (db_handle, close_token) = match router.spawn_worker(&req.path, None).await {
             Ok(r) => r,
             Err(e) => return Ok(ToolError::OpenFailed(e.to_string()).to_tool_result()),
         };

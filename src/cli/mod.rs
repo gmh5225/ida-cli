@@ -19,6 +19,9 @@ pub struct CliArgs {
     path: Option<String>,
 
     #[arg(long, global = true)]
+    tenant: Option<String>,
+
+    #[arg(long, global = true)]
     json: bool,
 
     #[arg(long, global = true)]
@@ -144,7 +147,7 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
             handle_response(&resp, &req.method, &output_mode)
         }
         cmd => {
-            let (method, params) = build_rpc_params(&cmd, args.path.as_deref());
+            let (method, params) = build_rpc_params(&cmd, args.path.as_deref(), args.tenant.as_deref());
             let req = RpcRequest::new("1", &method, params);
             let resp = send_request(&socket_path, &req, timeout).await?;
             handle_response(&resp, &method, &output_mode)
@@ -152,10 +155,17 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
     }
 }
 
-fn build_rpc_params(cmd: &CliCommand, path: Option<&str>) -> (String, serde_json::Value) {
+fn build_rpc_params(
+    cmd: &CliCommand,
+    path: Option<&str>,
+    tenant: Option<&str>,
+) -> (String, serde_json::Value) {
     let mut params = serde_json::Map::new();
     if let Some(p) = path {
         params.insert("path".to_string(), serde_json::json!(p));
+    }
+    if let Some(tenant) = tenant {
+        params.insert("tenant_id".to_string(), serde_json::json!(tenant));
     }
 
     let method = match cmd {

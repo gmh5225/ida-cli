@@ -96,13 +96,18 @@ async fn dispatch_cli_request(
         .get("path")
         .and_then(|v| v.as_str())
         .map(String::from);
+    let tenant_id = req
+        .params
+        .get("tenant_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     match method {
         "close" => {
             let resp = if let Some(ref p) = path {
                 let canonical =
                     std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
-                match router.close_by_path(&canonical).await {
+                match router.close_by_path(&canonical, tenant_id.as_deref()).await {
                     Ok(()) => RpcResponse::ok(&req.id, serde_json::json!({"ok": true})),
                     Err(e) => RpcResponse::err(&req.id, -32000, e.to_string()),
                 }
@@ -174,7 +179,7 @@ async fn dispatch_cli_request(
         _ => {
             let resolve_result = if let Some(ref p) = path {
                 router
-                    .ensure_worker_with_ref(p)
+                    .ensure_worker_with_ref(p, tenant_id.as_deref())
                     .await
                     .map(|(h, token)| (h, Some(token)))
             } else {
