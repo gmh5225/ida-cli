@@ -87,6 +87,9 @@ struct ServeHttpArgs {
         default_value = "http://localhost,http://127.0.0.1"
     )]
     allow_origin: Vec<String>,
+    /// Maximum number of in-flight HTTP requests before returning 503.
+    #[arg(long, default_value_t = 256)]
+    max_inflight_requests: usize,
 }
 
 #[derive(Args, Clone)]
@@ -97,21 +100,30 @@ struct ServeWorkerArgs {
 }
 
 #[derive(Clone)]
-struct OriginCheckService<S> {
+struct GatewayService<S> {
     inner: S,
     allowed_origins: Arc<std::collections::HashSet<String>>,
+    router: ida_mcp::router::RouterState,
+    inflight_limit: Arc<tokio::sync::Semaphore>,
 }
 
-impl<S> OriginCheckService<S> {
-    fn new(inner: S, allowed_origins: Arc<std::collections::HashSet<String>>) -> Self {
+impl<S> GatewayService<S> {
+    fn new(
+        inner: S,
+        allowed_origins: Arc<std::collections::HashSet<String>>,
+        router: ida_mcp::router::RouterState,
+        inflight_limit: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
         Self {
             inner,
             allowed_origins,
+            router,
+            inflight_limit,
         }
     }
 }
 
-impl<B, S> Service<Request<B>> for OriginCheckService<S>
+impl<B, S> Service<Request<B>> for GatewayService<S>
 where
     B: http_body::Body + Send + 'static,
     B::Error: std::fmt::Display,
@@ -139,8 +151,49 @@ where
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
         let allowed_origins = self.allowed_origins.clone();
+        let router = self.router.clone();
+        let inflight_limit = self.inflight_limit.clone();
         let mut inner = self.inner.clone();
         Box::pin(async move {
+            let path = req.uri().path().to_string();
+
+            if req.method() == hyper::http::Method::GET {
+                if path == "/healthz" {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({"ok": true, "service": "ida-cli"}),
+                    ));
+                }
+                if path == "/readyz" {
+                    let status = router.status_snapshot().await;
+                    let ready = status
+                        .runtime_probe
+                        .as_ref()
+                        .map(|probe| probe.supported)
+                        .unwrap_or(false);
+                    let code = if ready {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    };
+                    return Ok(json_response(
+                        code,
+                        serde_json::json!({
+                            "ok": ready,
+                            "runtime_probe": status.runtime_probe,
+                            "worker_count": status.worker_count,
+                            "max_workers": status.max_workers,
+                        }),
+                    ));
+                }
+                if path == "/statusz" {
+                    let status = router.status_snapshot().await;
+                    let value = serde_json::to_value(status)
+                        .unwrap_or_else(|_| serde_json::json!({"error": "status serialization failed"}));
+                    return Ok(json_response(StatusCode::OK, value));
+                }
+            }
+
             if let Some(origin) = req.headers().get(ORIGIN).and_then(|v| v.to_str().ok()) {
                 if !allowed_origins.contains(origin) {
                     let resp = Response::builder()
@@ -150,9 +203,30 @@ where
                     return Ok(resp);
                 }
             }
+
+            let Ok(_permit) = inflight_limit.clone().try_acquire_owned() else {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "server overloaded",
+                        "reason": "max in-flight request limit reached",
+                    }),
+                ));
+            };
+
             inner.call(req).await
         })
     }
+}
+
+fn json_response(status: StatusCode, value: serde_json::Value) -> Response<BoxBody<Bytes, std::convert::Infallible>> {
+    let body = serde_json::to_vec(&value).unwrap_or_else(|_| b"{\"error\":\"serialization failed\"}".to_vec());
+    Response::builder()
+        .status(status)
+        .header(hyper::http::header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(body)).boxed())
+        .expect("valid response")
 }
 
 #[derive(Args)]
@@ -680,7 +754,14 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
                 .filter(|s| !s.is_empty())
                 .collect();
             let allowed_origins = Arc::new(allowed_origins);
-            let service = OriginCheckService::new(service, allowed_origins);
+            let inflight_limit =
+                Arc::new(tokio::sync::Semaphore::new(args.max_inflight_requests.max(1)));
+            let service = GatewayService::new(
+                service,
+                allowed_origins,
+                router.clone(),
+                inflight_limit,
+            );
 
             let listener = tokio::net::TcpListener::bind(bind_addr)
                 .await
