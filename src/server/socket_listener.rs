@@ -122,13 +122,10 @@ async fn dispatch_cli_request(
         }
 
         "status" => {
-            let handles = router.all_handles().await;
+            let status = router.status_snapshot().await;
             let resp = RpcResponse::ok(
                 &req.id,
-                serde_json::json!({
-                    "worker_count": handles.len(),
-                    "workers": handles,
-                }),
+                serde_json::to_value(status).unwrap_or_else(|_| serde_json::json!({})),
             );
             (resp, None)
         }

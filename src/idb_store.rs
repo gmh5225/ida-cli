@@ -76,6 +76,14 @@ pub struct IdbEntry {
     pub last_accessed: String, // ISO 8601
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IdbStoreStats {
+    pub root: String,
+    pub file_count: usize,
+    pub entry_count: usize,
+    pub total_size_bytes: u64,
+}
+
 fn now_iso8601() -> String {
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -199,6 +207,31 @@ impl IdbStore {
             .and_then(|s| serde_json::from_str::<HashMap<String, IdbEntry>>(&s).ok())
             .map(|m| m.into_values().collect())
             .unwrap_or_default()
+    }
+
+    pub fn stats(&self) -> IdbStoreStats {
+        let mut file_count = 0usize;
+        let mut total_size_bytes = 0u64;
+
+        if let Ok(entries) = std::fs::read_dir(&self.root) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_file() {
+                        file_count += 1;
+                        total_size_bytes = total_size_bytes.saturating_add(meta.len());
+                    }
+                }
+            }
+        }
+
+        let entry_count = self.list().len();
+
+        IdbStoreStats {
+            root: self.root.display().to_string(),
+            file_count,
+            entry_count,
+            total_size_bytes,
+        }
     }
 
     /// Remove an entry by hash: deletes from `index.json` and all related

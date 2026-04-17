@@ -9,6 +9,7 @@ pub mod protocol;
 
 use crate::ida::{RuntimeProbeResult, WorkerBackendKind};
 use crate::router::protocol::{RpcRequest, RpcResponse};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::Command;
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
 
 pub type DbHandle = String;
@@ -32,9 +33,74 @@ pub struct WorkerProcess {
     pub last_active: Instant,
 }
 
+#[derive(Debug, Clone)]
+pub struct RouterConfig {
+    pub max_workers: usize,
+    pub max_pending_per_worker: usize,
+    pub max_concurrent_spawns: usize,
+}
+
+impl RouterConfig {
+    pub fn from_env() -> Self {
+        let cpu_hint = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let default_max_workers = cpu_hint.saturating_mul(8).max(16);
+        let max_workers = std::env::var("IDA_CLI_MAX_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default_max_workers);
+        let max_pending_per_worker = std::env::var("IDA_CLI_MAX_PENDING_PER_WORKER")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(64);
+        let max_concurrent_spawns = std::env::var("IDA_CLI_MAX_CONCURRENT_SPAWNS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or_else(|| max_workers.clamp(1, 4));
+
+        Self {
+            max_workers,
+            max_pending_per_worker,
+            max_concurrent_spawns,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerStatus {
+    pub handle: String,
+    pub backend: String,
+    pub pid: Option<u32>,
+    pub open_path: Option<String>,
+    pub pending_requests: usize,
+    pub ref_count: usize,
+    pub idle_secs: u64,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RouterStatus {
+    pub worker_count: usize,
+    pub active_handle: Option<String>,
+    pub max_workers: usize,
+    pub max_pending_per_worker: usize,
+    pub max_concurrent_spawns: usize,
+    pub runtime_probe: Option<RuntimeProbeResult>,
+    pub workers: Vec<WorkerStatus>,
+    pub idb_cache: crate::idb_store::IdbStoreStats,
+    pub response_cache: crate::server::response_cache::ResponseCacheStats,
+}
+
 #[derive(Clone)]
 pub struct RouterState {
     inner: Arc<Mutex<RouterInner>>,
+    config: Arc<RouterConfig>,
+    spawn_gate: Arc<Semaphore>,
+    cached_probe: Arc<Mutex<Option<RuntimeProbeResult>>>,
 }
 
 impl std::fmt::Debug for RouterState {
@@ -56,6 +122,7 @@ struct RouterInner {
 impl RouterState {
     pub fn new() -> anyhow::Result<Self> {
         let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ida-cli"));
+        let config = Arc::new(RouterConfig::from_env());
 
         Ok(Self {
             inner: Arc::new(Mutex::new(RouterInner {
@@ -67,6 +134,9 @@ impl RouterState {
                 req_counter: 0,
                 exe_path,
             })),
+            config: config.clone(),
+            spawn_gate: Arc::new(Semaphore::new(config.max_concurrent_spawns)),
+            cached_probe: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -79,8 +149,13 @@ impl RouterState {
     }
 
     async fn probe_worker_backend(
+        &self,
         exe_path: &std::path::Path,
     ) -> Result<RuntimeProbeResult, anyhow::Error> {
+        if let Some(cached) = self.cached_probe.lock().await.clone() {
+            return Ok(cached);
+        }
+
         let mut cmd = Command::new(exe_path);
         cmd.arg("probe-runtime")
             .stdin(std::process::Stdio::null())
@@ -104,11 +179,13 @@ impl RouterState {
             return Err(anyhow::anyhow!(msg));
         }
 
-        serde_json::from_str::<RuntimeProbeResult>(&stdout).map_err(|e| {
+        let probe = serde_json::from_str::<RuntimeProbeResult>(&stdout).map_err(|e| {
             anyhow::anyhow!(
                 "failed to parse probe-runtime output: {e}; stdout={stdout:?}; stderr={stderr:?}"
             )
-        })
+        })?;
+        *self.cached_probe.lock().await = Some(probe.clone());
+        Ok(probe)
     }
 
     /// Spawn a new worker subprocess for the given IDB path.
@@ -153,7 +230,13 @@ impl RouterState {
 
             inner.exe_path.clone()
         };
-        let probe = Self::probe_worker_backend(&exe_path).await?;
+        let _spawn_permit = self
+            .spawn_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("spawn gate is closed"))?;
+        let probe = self.probe_worker_backend(&exe_path).await?;
         let backend = probe.backend.ok_or_else(|| {
             anyhow::anyhow!(
                 "{}",
@@ -173,6 +256,12 @@ impl RouterState {
         );
 
         let mut inner = self.inner.lock().await;
+        if inner.workers.len() >= self.config.max_workers {
+            return Err(anyhow::anyhow!(
+                "worker limit reached ({})",
+                self.config.max_workers
+            ));
+        }
         if let Some(existing_handle) = inner.path_to_handle.get(&canonical_path).cloned() {
             info!(
                 "Path {:?} became active while probing backend; reusing handle {}",
@@ -441,6 +530,9 @@ impl RouterState {
             let worker = inner.workers.get_mut(&target_handle).ok_or_else(|| {
                 ToolError::InvalidParams(format!("Worker {} not found", target_handle))
             })?;
+            if worker.pending.len() >= self.config.max_pending_per_worker {
+                return Err(ToolError::Busy);
+            }
 
             let req = RpcRequest::new(&req_id, method, params);
             let json = serde_json::to_string(&req)
@@ -535,6 +627,37 @@ impl RouterState {
     pub async fn worker_count(&self) -> usize {
         let inner = self.inner.lock().await;
         inner.workers.len()
+    }
+
+    pub async fn status_snapshot(&self) -> RouterStatus {
+        let runtime_probe = self.cached_probe.lock().await.clone();
+        let inner = self.inner.lock().await;
+        let workers = inner
+            .workers
+            .iter()
+            .map(|(handle, worker)| WorkerStatus {
+                handle: handle.clone(),
+                backend: worker.backend.to_string(),
+                pid: worker.child.id(),
+                open_path: worker.open_path.as_ref().map(|p| p.display().to_string()),
+                pending_requests: worker.pending.len(),
+                ref_count: inner.ref_tokens.get(handle).map(|s| s.len()).unwrap_or(0),
+                idle_secs: worker.last_active.elapsed().as_secs(),
+                active: inner.active.as_deref() == Some(handle.as_str()),
+            })
+            .collect();
+
+        RouterStatus {
+            worker_count: inner.workers.len(),
+            active_handle: inner.active.clone(),
+            max_workers: self.config.max_workers,
+            max_pending_per_worker: self.config.max_pending_per_worker,
+            max_concurrent_spawns: self.config.max_concurrent_spawns,
+            runtime_probe,
+            workers,
+            idb_cache: crate::idb_store::IdbStore::new().stats(),
+            response_cache: crate::server::response_cache::stats(),
+        }
     }
 
     pub async fn shutdown_all(&self) {

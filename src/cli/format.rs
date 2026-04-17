@@ -106,17 +106,81 @@ fn format_segment_list(v: &Value) -> String {
 
 fn format_status(v: &Value) -> String {
     let count = v.get("worker_count").and_then(|v| v.as_u64()).unwrap_or(0);
-    let workers = v
-        .get("workers")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
-    format!("worker_count: {count}\nworkers: [{workers}]")
+    let max_workers = v.get("max_workers").and_then(|v| v.as_u64());
+    let max_pending = v.get("max_pending_per_worker").and_then(|v| v.as_u64());
+    let max_spawns = v.get("max_concurrent_spawns").and_then(|v| v.as_u64());
+    let active = v.get("active_handle").and_then(|v| v.as_str()).unwrap_or("-");
+
+    let mut lines = vec![format!("worker_count: {count}")];
+    if let Some(max_workers) = max_workers {
+        lines.push(format!("max_workers: {max_workers}"));
+    }
+    if let Some(max_pending) = max_pending {
+        lines.push(format!("max_pending_per_worker: {max_pending}"));
+    }
+    if let Some(max_spawns) = max_spawns {
+        lines.push(format!("max_concurrent_spawns: {max_spawns}"));
+    }
+    lines.push(format!("active_handle: {active}"));
+
+    if let Some(runtime) = v.get("runtime_probe") {
+        let backend = runtime
+            .get("backend")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none");
+        let supported = runtime
+            .get("supported")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        lines.push(format!("runtime_backend: {backend} (supported={supported})"));
+    }
+
+    if let Some(cache) = v.get("idb_cache") {
+        let files = cache.get("file_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let bytes = cache
+            .get("total_size_bytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        lines.push(format!("idb_cache: {files} files, {bytes} bytes"));
+    }
+    if let Some(cache) = v.get("response_cache") {
+        let files = cache.get("file_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let bytes = cache
+            .get("total_size_bytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        lines.push(format!("response_cache: {files} files, {bytes} bytes"));
+    }
+
+    if let Some(workers) = v.get("workers").and_then(|v| v.as_array()) {
+        if workers.is_empty() {
+            lines.push("workers: []".to_string());
+        } else {
+            lines.push("workers:".to_string());
+            for worker in workers {
+                let handle = worker.get("handle").and_then(|v| v.as_str()).unwrap_or("?");
+                let backend = worker
+                    .get("backend")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let pending = worker
+                    .get("pending_requests")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let refs = worker.get("ref_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                let idle = worker.get("idle_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+                let path = worker
+                    .get("open_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                lines.push(format!(
+                    "  {handle} backend={backend} pending={pending} refs={refs} idle={idle}s path={path}"
+                ));
+            }
+        }
+    }
+
+    lines.join("\n")
 }
 
 fn truncate_output(s: &str) -> String {

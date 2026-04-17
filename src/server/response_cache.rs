@@ -4,6 +4,13 @@ use std::path::Path;
 const DEFAULT_MAX_INLINE_BYTES: usize = 512;
 const CACHE_DIR: &str = "/tmp/ida-cli-out";
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResponseCacheStats {
+    pub dir: String,
+    pub file_count: usize,
+    pub total_size_bytes: u64,
+}
+
 pub fn guard_response_size(method: &str, result: Value) -> Value {
     let max_bytes = std::env::var("IDA_MCP_MAX_INLINE_BYTES")
         .ok()
@@ -79,4 +86,27 @@ fn count_items(v: &Value) -> Option<usize> {
         return Some(arr.len());
     }
     None
+}
+
+pub fn stats() -> ResponseCacheStats {
+    let path = Path::new(CACHE_DIR);
+    let mut file_count = 0usize;
+    let mut total_size_bytes = 0u64;
+
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    file_count += 1;
+                    total_size_bytes = total_size_bytes.saturating_add(meta.len());
+                }
+            }
+        }
+    }
+
+    ResponseCacheStats {
+        dir: path.display().to_string(),
+        file_count,
+        total_size_bytes,
+    }
 }
