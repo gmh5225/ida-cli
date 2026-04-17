@@ -112,6 +112,41 @@ The recommended path from the current codebase is:
 4. Add capability-aware routing so unsupported methods never hit the wrong backend.
 5. Add backend smoke tests to CI for every supported runtime/backend pair.
 
+## Federation Skeleton
+
+The codebase now includes a minimal federation status layer.
+
+Set:
+
+`IDA_CLI_FEDERATION_CONFIG=/path/to/nodes.json`
+
+Example:
+
+```json
+[
+  {
+    "name": "node-a",
+    "url": "http://127.0.0.1:9876",
+    "weight": 1,
+    "enabled": true
+  },
+  {
+    "name": "node-b",
+    "url": "http://127.0.0.1:9976",
+    "weight": 2,
+    "enabled": true
+  }
+]
+```
+
+Current behavior:
+
+- loads static node config
+- probes `/healthz` and `/readyz`
+- exposes federation node state through router status
+
+This is a federation status and discovery skeleton, not yet a full remote execution fabric.
+
 ## Validation
 
 The repository now includes a 9.x compatibility verification script:

@@ -309,6 +309,7 @@ pub struct RouterStatus {
     pub recent_tasks: Vec<serde_json::Value>,
     pub idb_cache: crate::idb_store::IdbStoreStats,
     pub response_cache: crate::server::response_cache::ResponseCacheStats,
+    pub federation_nodes: Vec<crate::federation::FederationNodeStatus>,
 }
 
 #[derive(Clone)]
@@ -1106,6 +1107,9 @@ impl RouterState {
             recent_tasks,
             idb_cache: crate::idb_store::IdbStore::new().stats(),
             response_cache: crate::server::response_cache::stats(),
+            federation_nodes: crate::federation::probe_nodes(
+                &crate::federation::load_nodes_from_env(),
+            ),
         }
     }
 

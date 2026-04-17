@@ -82,6 +82,7 @@ pub mod cli;
 pub mod disasm;
 pub mod dsc;
 pub mod error;
+pub mod federation;
 pub mod ida;
 pub mod idat_compat;
 pub mod idb_store;
