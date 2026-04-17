@@ -3,8 +3,9 @@
 //! Manages the `~/.ida/` directory hierarchy and an `index.json` that tracks
 //! metadata about every analysed binary.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
@@ -74,6 +75,22 @@ pub struct IdbEntry {
     pub size: u64,
     pub created_at: String,    // ISO 8601
     pub last_accessed: String, // ISO 8601
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IdbStoreStats {
+    pub root: String,
+    pub file_count: usize,
+    pub entry_count: usize,
+    pub total_size_bytes: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IdbEvictionStats {
+    pub evicted_groups: usize,
+    pub evicted_files: usize,
+    pub evicted_bytes: u64,
+    pub remaining_bytes: u64,
 }
 
 fn now_iso8601() -> String {
@@ -199,6 +216,119 @@ impl IdbStore {
             .and_then(|s| serde_json::from_str::<HashMap<String, IdbEntry>>(&s).ok())
             .map(|m| m.into_values().collect())
             .unwrap_or_default()
+    }
+
+    pub fn stats(&self) -> IdbStoreStats {
+        let mut file_count = 0usize;
+        let mut total_size_bytes = 0u64;
+
+        if let Ok(entries) = std::fs::read_dir(&self.root) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_file() {
+                        file_count += 1;
+                        total_size_bytes = total_size_bytes.saturating_add(meta.len());
+                    }
+                }
+            }
+        }
+
+        let entry_count = self.list().len();
+
+        IdbStoreStats {
+            root: self.root.display().to_string(),
+            file_count,
+            entry_count,
+            total_size_bytes,
+        }
+    }
+
+    pub fn evict_to_limit(
+        &self,
+        max_bytes: u64,
+        pinned_group_stems: &HashSet<String>,
+    ) -> IdbEvictionStats {
+        struct Group {
+            files: Vec<PathBuf>,
+            bytes: u64,
+            newest_mtime: SystemTime,
+        }
+
+        impl Default for Group {
+            fn default() -> Self {
+                Self {
+                    files: Vec::new(),
+                    bytes: 0,
+                    newest_mtime: SystemTime::UNIX_EPOCH,
+                }
+            }
+        }
+
+        let mut groups: BTreeMap<String, Group> = BTreeMap::new();
+        let mut total_size = 0u64;
+
+        if let Ok(entries) = std::fs::read_dir(&self.root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                if !meta.is_file() {
+                    continue;
+                }
+                total_size = total_size.saturating_add(meta.len());
+                let stem = path.with_extension("").display().to_string();
+                let group = groups.entry(stem).or_default();
+                group.files.push(path);
+                group.bytes = group.bytes.saturating_add(meta.len());
+                let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                if mtime > group.newest_mtime {
+                    group.newest_mtime = mtime;
+                }
+            }
+        }
+
+        if total_size <= max_bytes {
+            return IdbEvictionStats {
+                evicted_groups: 0,
+                evicted_files: 0,
+                evicted_bytes: 0,
+                remaining_bytes: total_size,
+            };
+        }
+
+        let mut ordered: Vec<(String, Group)> = groups.into_iter().collect();
+        ordered.sort_by_key(|(_, group)| group.newest_mtime);
+
+        let mut evicted_groups = 0usize;
+        let mut evicted_files = 0usize;
+        let mut evicted_bytes = 0u64;
+
+        for (stem, group) in ordered {
+            if total_size <= max_bytes {
+                break;
+            }
+            if pinned_group_stems.contains(&stem) {
+                continue;
+            }
+
+            for file in &group.files {
+                let _ = std::fs::remove_file(file);
+            }
+            total_size = total_size.saturating_sub(group.bytes);
+            evicted_groups += 1;
+            evicted_files += group.files.len();
+            evicted_bytes = evicted_bytes.saturating_add(group.bytes);
+        }
+
+        let _ = self.clean();
+
+        IdbEvictionStats {
+            evicted_groups,
+            evicted_files,
+            evicted_bytes,
+            remaining_bytes: total_size,
+        }
     }
 
     /// Remove an entry by hash: deletes from `index.json` and all related

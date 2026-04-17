@@ -1,4 +1,4 @@
-//! Headless IDA Pro MCP Server
+//! Headless IDA CLI and MCP Server
 //!
 //! This library provides an MCP (Model Context Protocol) server for headless
 //! IDA Pro access. It allows LLM agents to open IDA databases, list functions,
@@ -82,7 +82,10 @@ pub mod cli;
 pub mod disasm;
 pub mod dsc;
 pub mod error;
+pub mod federation;
 pub mod ida;
+pub mod idat_compat;
+pub mod idb_store;
 pub mod router;
 pub mod rpc_dispatch;
 pub mod sbpf;

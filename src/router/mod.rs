@@ -1,26 +1,39 @@
 //! Multi-IDB Router — manages worker subprocesses.
 //!
 //! Architecture:
-//! - Each open IDB gets a `WorkerProcess` running `ida-mcp serve-worker`
+//! - Each open IDB gets a `WorkerProcess` running `ida-cli serve-worker`
 //! - Requests are routed to workers via JSON-RPC over stdin/stdout
 //! - Router maintains an "active" handle for backward compatibility
 
 pub mod protocol;
 
+use crate::ida::{RuntimeProbeResult, WorkerBackendKind};
 use crate::router::protocol::{RpcRequest, RpcResponse};
+use crate::server::task::{TaskRegistry, TaskState, TaskStatus};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::process::Command;
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
 
 pub type DbHandle = String;
 pub type ReqId = String;
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct WorkerKey {
+    tenant_id: String,
+    path: PathBuf,
+}
+
 pub struct WorkerProcess {
+    pub backend: WorkerBackendKind,
+    pub tenant_id: String,
     pub child: Child,
     pub writer: BufWriter<ChildStdin>,
     pub pending: HashMap<ReqId, oneshot::Sender<Result<serde_json::Value, String>>>,
@@ -29,9 +42,288 @@ pub struct WorkerProcess {
     pub last_active: Instant,
 }
 
+#[derive(Debug, Clone)]
+pub struct RouterConfig {
+    pub max_workers: usize,
+    pub max_workers_per_tenant: usize,
+    pub max_pending_per_worker: usize,
+    pub max_pending_per_tenant: usize,
+    pub max_concurrent_spawns: usize,
+    pub max_warm_workers: usize,
+    pub max_queued_prewarms: usize,
+    pub max_active_prewarms: usize,
+    pub max_prewarms_per_tenant: usize,
+    pub max_idb_cache_bytes: u64,
+    pub max_response_cache_bytes: u64,
+    pub max_queued_tasks: usize,
+    pub max_active_tasks: usize,
+    pub max_tasks_per_tenant: usize,
+    pub node_id: String,
+}
+
+impl RouterConfig {
+    pub fn from_env() -> Self {
+        let cpu_hint = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let default_max_workers = cpu_hint.saturating_mul(8).max(16);
+        let max_workers = std::env::var("IDA_CLI_MAX_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default_max_workers);
+        let max_pending_per_worker = std::env::var("IDA_CLI_MAX_PENDING_PER_WORKER")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(64);
+        let max_workers_per_tenant = std::env::var("IDA_CLI_MAX_WORKERS_PER_TENANT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or((default_max_workers / 4).max(4));
+        let max_pending_per_tenant = std::env::var("IDA_CLI_MAX_PENDING_PER_TENANT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(512);
+        let max_concurrent_spawns = std::env::var("IDA_CLI_MAX_CONCURRENT_SPAWNS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or_else(|| max_workers.clamp(1, 4));
+        let max_warm_workers = std::env::var("IDA_CLI_MAX_WARM_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(16);
+        let max_queued_prewarms = std::env::var("IDA_CLI_MAX_QUEUED_PREWARMS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(256);
+        let max_active_prewarms = std::env::var("IDA_CLI_MAX_ACTIVE_PREWARMS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(4);
+        let max_prewarms_per_tenant = std::env::var("IDA_CLI_MAX_PREWARMS_PER_TENANT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(2);
+        let max_idb_cache_bytes = std::env::var("IDA_CLI_MAX_IDB_CACHE_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(50 * 1024 * 1024 * 1024);
+        let max_response_cache_bytes = std::env::var("IDA_CLI_MAX_RESPONSE_CACHE_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2 * 1024 * 1024 * 1024);
+        let max_queued_tasks = std::env::var("IDA_CLI_MAX_QUEUED_TASKS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(512);
+        let max_active_tasks = std::env::var("IDA_CLI_MAX_ACTIVE_TASKS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(16);
+        let max_tasks_per_tenant = std::env::var("IDA_CLI_MAX_TASKS_PER_TENANT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(8);
+        let node_id = std::env::var("IDA_CLI_NODE_ID").unwrap_or_else(|_| {
+            format!(
+                "{}-{}",
+                std::env::var("HOSTNAME").unwrap_or_else(|_| "ida-cli".to_string()),
+                std::process::id()
+            )
+        });
+
+        Self {
+            max_workers,
+            max_workers_per_tenant,
+            max_pending_per_worker,
+            max_pending_per_tenant,
+            max_concurrent_spawns,
+            max_warm_workers,
+            max_queued_prewarms,
+            max_active_prewarms,
+            max_prewarms_per_tenant,
+            max_idb_cache_bytes,
+            max_response_cache_bytes,
+            max_queued_tasks,
+            max_active_tasks,
+            max_tasks_per_tenant,
+            node_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WarmLease {
+    handle: DbHandle,
+    token: String,
+    path: PathBuf,
+    cache_path: Option<PathBuf>,
+    tenant_id: String,
+    pinned_at: Instant,
+    last_hit: Instant,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WarmLeaseStatus {
+    pub path: String,
+    pub handle: String,
+    pub tenant_id: String,
+    pub cache_path: Option<String>,
+    pub pinned_secs: u64,
+    pub idle_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedPrewarmTask {
+    task_id: String,
+    path: String,
+    tenant_id: String,
+    priority: u8,
+    keep_warm: bool,
+    enqueued_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct ActivePrewarmTask {
+    task_id: String,
+    path: String,
+    tenant_id: String,
+    priority: u8,
+    keep_warm: bool,
+    started_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedRouteTask {
+    task_id: String,
+    path: String,
+    method: String,
+    params: serde_json::Value,
+    tenant_id: String,
+    priority: u8,
+    enqueued_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveRouteTask {
+    task_id: String,
+    path: String,
+    method: String,
+    tenant_id: String,
+    priority: u8,
+    started_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct PrewarmQueueState {
+    queued: Vec<QueuedPrewarmTask>,
+    active: HashMap<String, ActivePrewarmTask>,
+    recent: Vec<serde_json::Value>,
+    next_task_id: u64,
+    tenant_active: HashMap<String, usize>,
+}
+
+#[derive(Debug, Default)]
+struct RouteQueueState {
+    queued: Vec<QueuedRouteTask>,
+    active: HashMap<String, ActiveRouteTask>,
+    tenant_active: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PrewarmTaskStatus {
+    pub task_id: String,
+    pub path: String,
+    pub tenant_id: String,
+    pub priority: u8,
+    pub keep_warm: bool,
+    pub state: String,
+    pub age_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteTaskStatus {
+    pub task_id: String,
+    pub path: String,
+    pub method: String,
+    pub tenant_id: String,
+    pub priority: u8,
+    pub state: String,
+    pub age_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerStatus {
+    pub handle: String,
+    pub backend: String,
+    pub tenant_id: String,
+    pub pid: Option<u32>,
+    pub open_path: Option<String>,
+    pub pending_requests: usize,
+    pub ref_count: usize,
+    pub idle_secs: u64,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RouterStatus {
+    pub worker_count: usize,
+    pub active_handle: Option<String>,
+    pub max_workers: usize,
+    pub max_workers_per_tenant: usize,
+    pub max_pending_per_worker: usize,
+    pub max_pending_per_tenant: usize,
+    pub max_concurrent_spawns: usize,
+    pub max_warm_workers: usize,
+    pub max_queued_prewarms: usize,
+    pub max_active_prewarms: usize,
+    pub max_prewarms_per_tenant: usize,
+    pub max_idb_cache_bytes: u64,
+    pub max_response_cache_bytes: u64,
+    pub max_queued_tasks: usize,
+    pub max_active_tasks: usize,
+    pub max_tasks_per_tenant: usize,
+    pub node_id: String,
+    pub runtime_probe: Option<RuntimeProbeResult>,
+    pub backend_counts: HashMap<String, usize>,
+    pub tenant_worker_counts: HashMap<String, usize>,
+    pub tenant_pending_counts: HashMap<String, usize>,
+    pub workers: Vec<WorkerStatus>,
+    pub warm_pool: Vec<WarmLeaseStatus>,
+    pub prewarm_queue: Vec<PrewarmTaskStatus>,
+    pub prewarm_active: Vec<PrewarmTaskStatus>,
+    pub prewarm_recent: Vec<serde_json::Value>,
+    pub route_queue: Vec<RouteTaskStatus>,
+    pub route_active: Vec<RouteTaskStatus>,
+    pub recent_tasks: Vec<serde_json::Value>,
+    pub idb_cache: crate::idb_store::IdbStoreStats,
+    pub response_cache: crate::server::response_cache::ResponseCacheStats,
+    pub federation_nodes: Vec<crate::federation::FederationNodeStatus>,
+}
+
 #[derive(Clone)]
 pub struct RouterState {
     inner: Arc<Mutex<RouterInner>>,
+    config: Arc<RouterConfig>,
+    spawn_gate: Arc<Semaphore>,
+    cached_probe: Arc<Mutex<Option<RuntimeProbeResult>>>,
+    warm_pool: Arc<Mutex<HashMap<PathBuf, WarmLease>>>,
+    prewarm_queue: Arc<Mutex<PrewarmQueueState>>,
+    route_queue: Arc<Mutex<RouteQueueState>>,
+    task_registry: TaskRegistry,
+    federation_nodes: Arc<Mutex<HashMap<String, crate::federation::FederationNodeRecord>>>,
+    maintenance_started: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for RouterState {
@@ -43,7 +335,7 @@ impl std::fmt::Debug for RouterState {
 struct RouterInner {
     workers: HashMap<DbHandle, WorkerProcess>,
     active: Option<DbHandle>,
-    path_to_handle: HashMap<PathBuf, DbHandle>,
+    path_to_handle: HashMap<WorkerKey, DbHandle>,
     token_to_handle: HashMap<String, DbHandle>,
     ref_tokens: HashMap<DbHandle, HashSet<String>>,
     req_counter: u64,
@@ -51,8 +343,24 @@ struct RouterInner {
 }
 
 impl RouterState {
+    fn normalize_tenant(tenant_id: Option<&str>) -> String {
+        tenant_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("default")
+            .to_string()
+    }
+
+    fn worker_key(path: PathBuf, tenant_id: &str) -> WorkerKey {
+        WorkerKey {
+            tenant_id: tenant_id.to_string(),
+            path,
+        }
+    }
+
     pub fn new() -> anyhow::Result<Self> {
-        let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ida-mcp"));
+        let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ida-cli"));
+        let config = Arc::new(RouterConfig::from_env());
 
         Ok(Self {
             inner: Arc::new(Mutex::new(RouterInner {
@@ -64,7 +372,118 @@ impl RouterState {
                 req_counter: 0,
                 exe_path,
             })),
+            config: config.clone(),
+            spawn_gate: Arc::new(Semaphore::new(config.max_concurrent_spawns)),
+            cached_probe: Arc::new(Mutex::new(None)),
+            warm_pool: Arc::new(Mutex::new(HashMap::new())),
+            prewarm_queue: Arc::new(Mutex::new(PrewarmQueueState::default())),
+            route_queue: Arc::new(Mutex::new(RouteQueueState::default())),
+            task_registry: TaskRegistry::new(),
+            federation_nodes: Arc::new(Mutex::new(crate::federation::load_node_map_from_env())),
+            maintenance_started: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    pub async fn federation_nodes_snapshot(&self) -> Vec<crate::federation::FederationNodeRecord> {
+        self.federation_nodes
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub async fn register_federation_node(
+        &self,
+        node: crate::federation::FederationNodeConfig,
+    ) -> serde_json::Value {
+        let mut nodes = self.federation_nodes.lock().await;
+        let replaced = nodes
+            .insert(
+                node.name.clone(),
+                crate::federation::FederationNodeRecord::new(node.clone(), "dynamic"),
+            )
+            .is_some();
+        serde_json::json!({
+            "ok": true,
+            "replaced": replaced,
+            "node": node,
+        })
+    }
+
+    pub async fn heartbeat_federation_node(
+        &self,
+        node: crate::federation::FederationNodeConfig,
+    ) -> serde_json::Value {
+        let mut nodes = self.federation_nodes.lock().await;
+        let mut record = nodes.remove(&node.name).unwrap_or_else(|| {
+            crate::federation::FederationNodeRecord::new(node.clone(), "heartbeat")
+        });
+        record.config = node.clone();
+        record.source = "heartbeat".to_string();
+        record.touch(crate::server::task::iso_now());
+        nodes.insert(node.name.clone(), record);
+        serde_json::json!({
+            "ok": true,
+            "node": node,
+        })
+    }
+
+    pub async fn unregister_federation_node(&self, name: &str) -> serde_json::Value {
+        let mut nodes = self.federation_nodes.lock().await;
+        let removed = nodes.remove(name).is_some();
+        serde_json::json!({
+            "ok": removed,
+            "name": name,
+        })
+    }
+
+    fn apply_worker_env(cmd: &mut Command) {
+        for var in &["DYLD_LIBRARY_PATH", "IDADIR", "LD_LIBRARY_PATH", "PATH"] {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
+    }
+
+    async fn probe_worker_backend(
+        &self,
+        exe_path: &std::path::Path,
+    ) -> Result<RuntimeProbeResult, anyhow::Error> {
+        if let Some(cached) = self.cached_probe.lock().await.clone() {
+            return Ok(cached);
+        }
+
+        let mut cmd = Command::new(exe_path);
+        cmd.arg("probe-runtime")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        Self::apply_worker_env(&mut cmd);
+
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to run probe-runtime: {e}"))?;
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        if !output.status.success() {
+            let mut msg = format!("probe-runtime exited with status {}", output.status);
+            if !stderr.is_empty() {
+                msg.push_str(&format!(": {stderr}"));
+            }
+            return Err(anyhow::anyhow!(msg));
+        }
+
+        let probe = serde_json::from_str::<RuntimeProbeResult>(&stdout).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to parse probe-runtime output: {e}; stdout={stdout:?}; stderr={stderr:?}"
+            )
+        })?;
+        *self.cached_probe.lock().await = Some(probe.clone());
+        Ok(probe)
     }
 
     /// Spawn a new worker subprocess for the given IDB path.
@@ -72,15 +491,133 @@ impl RouterState {
     pub async fn spawn_worker(
         &self,
         path: &str,
+        tenant_id: Option<&str>,
     ) -> Result<(DbHandle, Option<String>), anyhow::Error> {
         let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+        let tenant_id = Self::normalize_tenant(tenant_id);
+        let worker_key = Self::worker_key(canonical_path.clone(), &tenant_id);
+
+        let exe_path = {
+            let mut inner = self.inner.lock().await;
+
+            if let Some(existing_handle) = inner.path_to_handle.get(&worker_key).cloned() {
+                info!(
+                    "Tenant {} path {:?} already open with handle {}, issuing new ref token",
+                    tenant_id, canonical_path, existing_handle
+                );
+                let now = {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                };
+                let pid = std::process::id();
+                let nonce = inner.req_counter;
+                inner.req_counter += 1;
+                let ref_token = format!("{now:x}-{pid:x}-{nonce:x}");
+
+                inner
+                    .token_to_handle
+                    .insert(ref_token.clone(), existing_handle.clone());
+                inner
+                    .ref_tokens
+                    .entry(existing_handle.clone())
+                    .or_insert_with(HashSet::new)
+                    .insert(ref_token.clone());
+
+                return Ok((existing_handle, Some(ref_token)));
+            }
+
+            inner.exe_path.clone()
+        };
+        let _spawn_permit = self
+            .spawn_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("spawn gate is closed"))?;
+        let probe = self.probe_worker_backend(&exe_path).await?;
+        let backend = probe.backend.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}",
+                probe.reason.unwrap_or_else(|| {
+                    "runtime probe reported no usable worker backend".to_string()
+                })
+            )
+        })?;
+        let runtime = probe
+            .runtime
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "unknown".to_string());
+        info!(
+            "Spawning worker {} for path {:?} using backend {} (runtime {})",
+            "<pending>", canonical_path, backend, runtime
+        );
+
+        loop {
+            let maybe_evict = {
+                let inner = self.inner.lock().await;
+                if inner.workers.len() < self.config.max_workers {
+                    None
+                } else {
+                    inner
+                        .workers
+                        .iter()
+                        .filter(|(handle, worker)| {
+                            let ref_count = inner
+                                .ref_tokens
+                                .get(*handle)
+                                .map(|set| set.len())
+                                .unwrap_or(0);
+                            ref_count == 0
+                                && worker.pending.is_empty()
+                                && inner.active.as_deref() != Some(handle.as_str())
+                        })
+                        .min_by_key(|(_, worker)| worker.last_active)
+                        .map(|(handle, _)| handle.clone())
+                }
+            };
+
+            match maybe_evict {
+                Some(handle) => {
+                    warn!(
+                        handle = %handle,
+                        max_workers = self.config.max_workers,
+                        "worker limit reached, evicting oldest idle worker"
+                    );
+                    self.close_worker(&handle)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to evict idle worker: {e}"))?;
+                }
+                None => break,
+            }
+        }
 
         let mut inner = self.inner.lock().await;
-
-        if let Some(existing_handle) = inner.path_to_handle.get(&canonical_path).cloned() {
+        let tenant_worker_count = inner
+            .workers
+            .values()
+            .filter(|worker| worker.tenant_id == tenant_id)
+            .count();
+        if tenant_worker_count >= self.config.max_workers_per_tenant {
+            return Err(anyhow::anyhow!(
+                "tenant worker limit reached ({}) for tenant {}",
+                self.config.max_workers_per_tenant,
+                tenant_id
+            ));
+        }
+        if inner.workers.len() >= self.config.max_workers {
+            return Err(anyhow::anyhow!(
+                "worker limit reached ({}) and no idle worker was evictable",
+                self.config.max_workers
+            ));
+        }
+        if let Some(existing_handle) = inner.path_to_handle.get(&worker_key).cloned() {
             info!(
-                "Path {:?} already open with handle {}, issuing new ref token",
-                canonical_path, existing_handle
+                "Tenant {} path {:?} became active while probing backend; reusing handle {}",
+                tenant_id, canonical_path, existing_handle
             );
             let now = {
                 use std::time::{SystemTime, UNIX_EPOCH};
@@ -117,22 +654,20 @@ impl RouterState {
             inner.req_counter += 1;
             t ^ (pid << 32) ^ counter
         });
+        info!(
+            "Spawning worker {} for path {:?} using backend {} (runtime {})",
+            handle, canonical_path, backend, runtime
+        );
 
-        let exe_path = inner.exe_path.clone();
-        info!("Spawning worker {} for path {:?}", handle, canonical_path);
-
-        let mut cmd = tokio::process::Command::new(&exe_path);
+        let mut cmd = Command::new(&exe_path);
         cmd.arg("serve-worker")
+            .arg("--backend")
+            .arg(backend.as_cli_arg())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true);
-
-        for var in &["DYLD_LIBRARY_PATH", "IDADIR", "LD_LIBRARY_PATH", "PATH"] {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
-            }
-        }
+        Self::apply_worker_env(&mut cmd);
 
         let mut child = cmd
             .spawn()
@@ -161,6 +696,8 @@ impl RouterState {
         };
 
         let worker = WorkerProcess {
+            backend,
+            tenant_id: tenant_id.clone(),
             child,
             writer,
             pending: HashMap::new(),
@@ -201,7 +738,9 @@ impl RouterState {
                         // the process exit was expected — no warning needed.
                         if let Some(dead) = inner.workers.remove(&handle_for_reader) {
                             if let Some(path) = &dead.open_path {
-                                inner.path_to_handle.remove(path);
+                                inner
+                                    .path_to_handle
+                                    .remove(&Self::worker_key(path.clone(), &dead.tenant_id));
                             }
                             // dead.child drops here; kill_on_drop=true handles cleanup
                             if let Some(tokens) = inner.ref_tokens.remove(&handle_for_reader) {
@@ -262,7 +801,9 @@ impl RouterState {
                         }
                         if let Some(dead) = inner.workers.remove(&handle_for_reader) {
                             if let Some(path) = &dead.open_path {
-                                inner.path_to_handle.remove(path);
+                                inner
+                                    .path_to_handle
+                                    .remove(&Self::worker_key(path.clone(), &dead.tenant_id));
                             }
                         }
                         if let Some(tokens) = inner.ref_tokens.remove(&handle_for_reader) {
@@ -283,7 +824,7 @@ impl RouterState {
             }
         });
 
-        inner.path_to_handle.insert(canonical_path, handle.clone());
+        inner.path_to_handle.insert(worker_key, handle.clone());
         inner
             .token_to_handle
             .insert(close_token.clone(), handle.clone());
@@ -343,9 +884,29 @@ impl RouterState {
 
         {
             let mut inner = self.inner.lock().await;
+            let tenant_id = inner
+                .workers
+                .get(&target_handle)
+                .map(|worker| worker.tenant_id.clone())
+                .ok_or_else(|| {
+                    ToolError::InvalidParams(format!("Worker {} not found", target_handle))
+                })?;
+            let tenant_pending = inner
+                .workers
+                .values()
+                .filter(|candidate| candidate.tenant_id == tenant_id)
+                .map(|candidate| candidate.pending.len())
+                .sum::<usize>();
+            if tenant_pending >= self.config.max_pending_per_tenant {
+                return Err(ToolError::Busy);
+            }
+
             let worker = inner.workers.get_mut(&target_handle).ok_or_else(|| {
                 ToolError::InvalidParams(format!("Worker {} not found", target_handle))
             })?;
+            if worker.pending.len() >= self.config.max_pending_per_worker {
+                return Err(ToolError::Busy);
+            }
 
             let req = RpcRequest::new(&req_id, method, params);
             let json = serde_json::to_string(&req)
@@ -382,10 +943,16 @@ impl RouterState {
 
     pub async fn close_worker(&self, handle: &str) -> Result<(), crate::error::ToolError> {
         let mut inner = self.inner.lock().await;
+        self.warm_pool
+            .lock()
+            .await
+            .retain(|_, lease| lease.handle != handle);
 
         if let Some(mut worker) = inner.workers.remove(handle) {
             if let Some(path) = &worker.open_path {
-                inner.path_to_handle.remove(path);
+                inner
+                    .path_to_handle
+                    .remove(&Self::worker_key(path.clone(), &worker.tenant_id));
             }
             if let Some(tokens) = inner.ref_tokens.remove(handle) {
                 for token in &tokens {
@@ -442,6 +1009,179 @@ impl RouterState {
         inner.workers.len()
     }
 
+    async fn status_snapshot_inner(&self, include_federation: bool) -> RouterStatus {
+        let runtime_probe = match self.cached_probe.lock().await.clone() {
+            Some(probe) => Some(probe),
+            None => {
+                let exe_path = {
+                    let inner = self.inner.lock().await;
+                    inner.exe_path.clone()
+                };
+                self.probe_worker_backend(&exe_path).await.ok()
+            }
+        };
+        let inner = self.inner.lock().await;
+        let mut backend_counts: HashMap<String, usize> = HashMap::new();
+        let mut tenant_worker_counts: HashMap<String, usize> = HashMap::new();
+        let mut tenant_pending_counts: HashMap<String, usize> = HashMap::new();
+        let workers = inner
+            .workers
+            .iter()
+            .map(|(handle, worker)| {
+                let backend_name = worker.backend.to_string();
+                *backend_counts.entry(backend_name.clone()).or_default() += 1;
+                *tenant_worker_counts
+                    .entry(worker.tenant_id.clone())
+                    .or_default() += 1;
+                *tenant_pending_counts
+                    .entry(worker.tenant_id.clone())
+                    .or_default() += worker.pending.len();
+                WorkerStatus {
+                    handle: handle.clone(),
+                    backend: backend_name,
+                    tenant_id: worker.tenant_id.clone(),
+                    pid: worker.child.id(),
+                    open_path: worker.open_path.as_ref().map(|p| p.display().to_string()),
+                    pending_requests: worker.pending.len(),
+                    ref_count: inner.ref_tokens.get(handle).map(|s| s.len()).unwrap_or(0),
+                    idle_secs: worker.last_active.elapsed().as_secs(),
+                    active: inner.active.as_deref() == Some(handle.as_str()),
+                }
+            })
+            .collect();
+
+        let warm_pool = self
+            .warm_pool
+            .lock()
+            .await
+            .values()
+            .map(|lease| WarmLeaseStatus {
+                path: lease.path.display().to_string(),
+                handle: lease.handle.clone(),
+                tenant_id: lease.tenant_id.clone(),
+                cache_path: lease.cache_path.as_ref().map(|p| p.display().to_string()),
+                pinned_secs: lease.pinned_at.elapsed().as_secs(),
+                idle_secs: lease.last_hit.elapsed().as_secs(),
+            })
+            .collect();
+
+        let queue = self.prewarm_queue.lock().await;
+        let prewarm_queue = queue
+            .queued
+            .iter()
+            .map(|task| PrewarmTaskStatus {
+                task_id: task.task_id.clone(),
+                path: task.path.clone(),
+                tenant_id: task.tenant_id.clone(),
+                priority: task.priority,
+                keep_warm: task.keep_warm,
+                state: "queued".to_string(),
+                age_secs: task.enqueued_at.elapsed().as_secs(),
+            })
+            .collect();
+        let prewarm_active = queue
+            .active
+            .values()
+            .map(|task| PrewarmTaskStatus {
+                task_id: task.task_id.clone(),
+                path: task.path.clone(),
+                tenant_id: task.tenant_id.clone(),
+                priority: task.priority,
+                keep_warm: task.keep_warm,
+                state: "running".to_string(),
+                age_secs: task.started_at.elapsed().as_secs(),
+            })
+            .collect();
+        let prewarm_recent = queue.recent.clone();
+        drop(queue);
+
+        let route_queue = self.route_queue.lock().await;
+        let queued_route_tasks = route_queue
+            .queued
+            .iter()
+            .map(|task| RouteTaskStatus {
+                task_id: task.task_id.clone(),
+                path: task.path.clone(),
+                method: task.method.clone(),
+                tenant_id: task.tenant_id.clone(),
+                priority: task.priority,
+                state: "queued".to_string(),
+                age_secs: task.enqueued_at.elapsed().as_secs(),
+            })
+            .collect();
+        let active_route_tasks = route_queue
+            .active
+            .values()
+            .map(|task| RouteTaskStatus {
+                task_id: task.task_id.clone(),
+                path: task.path.clone(),
+                method: task.method.clone(),
+                tenant_id: task.tenant_id.clone(),
+                priority: task.priority,
+                state: "running".to_string(),
+                age_secs: task.started_at.elapsed().as_secs(),
+            })
+            .collect();
+        drop(route_queue);
+
+        let recent_tasks = self
+            .task_registry
+            .list_all()
+            .into_iter()
+            .filter(|task| task.status != TaskStatus::Running)
+            .rev()
+            .take(32)
+            .map(|task| task_state_json(&task))
+            .collect();
+
+        RouterStatus {
+            worker_count: inner.workers.len(),
+            active_handle: inner.active.clone(),
+            max_workers: self.config.max_workers,
+            max_workers_per_tenant: self.config.max_workers_per_tenant,
+            max_pending_per_worker: self.config.max_pending_per_worker,
+            max_pending_per_tenant: self.config.max_pending_per_tenant,
+            max_concurrent_spawns: self.config.max_concurrent_spawns,
+            max_warm_workers: self.config.max_warm_workers,
+            max_queued_prewarms: self.config.max_queued_prewarms,
+            max_active_prewarms: self.config.max_active_prewarms,
+            max_prewarms_per_tenant: self.config.max_prewarms_per_tenant,
+            max_idb_cache_bytes: self.config.max_idb_cache_bytes,
+            max_response_cache_bytes: self.config.max_response_cache_bytes,
+            max_queued_tasks: self.config.max_queued_tasks,
+            max_active_tasks: self.config.max_active_tasks,
+            max_tasks_per_tenant: self.config.max_tasks_per_tenant,
+            node_id: self.config.node_id.clone(),
+            runtime_probe,
+            backend_counts,
+            tenant_worker_counts,
+            tenant_pending_counts,
+            workers,
+            warm_pool,
+            prewarm_queue,
+            prewarm_active,
+            prewarm_recent,
+            route_queue: queued_route_tasks,
+            route_active: active_route_tasks,
+            recent_tasks,
+            idb_cache: crate::idb_store::IdbStore::new().stats(),
+            response_cache: crate::server::response_cache::stats(),
+            federation_nodes: if include_federation {
+                crate::federation::probe_nodes(&self.federation_nodes_snapshot().await)
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    pub async fn status_snapshot(&self) -> RouterStatus {
+        self.status_snapshot_inner(false).await
+    }
+
+    pub async fn status_snapshot_federated(&self) -> RouterStatus {
+        self.status_snapshot_inner(true).await
+    }
+
     pub async fn shutdown_all(&self) {
         let handles: Vec<DbHandle> = {
             let inner = self.inner.lock().await;
@@ -478,16 +1218,19 @@ impl RouterState {
     pub async fn ensure_worker_with_ref(
         &self,
         path: &str,
+        tenant_id: Option<&str>,
     ) -> Result<(DbHandle, String), crate::error::ToolError> {
-        self.ensure_worker_with_ref_idb(path, None).await
+        self.ensure_worker_with_ref_idb(path, None, tenant_id).await
     }
 
     pub async fn ensure_worker_with_ref_idb(
         &self,
         path: &str,
         explicit_idb_output: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<(DbHandle, String), crate::error::ToolError> {
         use crate::error::ToolError;
+        let tenant_id = Self::normalize_tenant(tenant_id);
 
         // Resolve sBPF .so → host-native dylib/i64 path for IDA.
         let resolved = resolve_open_path(path);
@@ -497,10 +1240,11 @@ impl RouterState {
             std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
         let canonical_open = std::fs::canonicalize(open_path)
             .unwrap_or_else(|_| std::path::PathBuf::from(open_path));
+        let worker_key = Self::worker_key(canonical.clone(), &tenant_id);
 
         let handle = {
             let mut inner = self.inner.lock().await;
-            if let Some(h) = inner.path_to_handle.get(&canonical).cloned() {
+            if let Some(h) = inner.path_to_handle.get(&worker_key).cloned() {
                 if let Some(worker) = inner.workers.get_mut(&h) {
                     worker.last_active = Instant::now();
                 }
@@ -514,7 +1258,7 @@ impl RouterState {
             h
         } else {
             let (h, initial_token) = self
-                .spawn_worker(path)
+                .spawn_worker(path, Some(&tenant_id))
                 .await
                 .map_err(|e| ToolError::IdaError(format!("spawn_worker failed: {e}")))?;
 
@@ -646,10 +1390,15 @@ impl RouterState {
     pub async fn close_by_path(
         &self,
         path: &std::path::Path,
+        tenant_id: Option<&str>,
     ) -> Result<(), crate::error::ToolError> {
+        let tenant_id = Self::normalize_tenant(tenant_id);
         let handle = {
             let inner = self.inner.lock().await;
-            inner.path_to_handle.get(path).cloned()
+            inner
+                .path_to_handle
+                .get(&Self::worker_key(path.to_path_buf(), &tenant_id))
+                .cloned()
         };
         if let Some(h) = handle {
             let _ = self
@@ -664,6 +1413,626 @@ impl RouterState {
         }
     }
 
+    pub async fn prewarm_path(
+        &self,
+        path: &str,
+    ) -> Result<serde_json::Value, crate::error::ToolError> {
+        self.prewarm_path_with_options(path, false, "default").await
+    }
+
+    pub async fn prewarm_path_with_options(
+        &self,
+        path: &str,
+        keep_warm: bool,
+        tenant_id: &str,
+    ) -> Result<serde_json::Value, crate::error::ToolError> {
+        use crate::error::ToolError;
+
+        let expanded = crate::expand_path(path);
+        if !expanded.exists() {
+            return Err(ToolError::InvalidPath(format!(
+                "File not found: {}",
+                expanded.display()
+            )));
+        }
+
+        let canonical = std::fs::canonicalize(&expanded).unwrap_or_else(|_| expanded.clone());
+        let tenant_id = Self::normalize_tenant(Some(tenant_id));
+        let already_open = {
+            let inner = self.inner.lock().await;
+            inner
+                .path_to_handle
+                .contains_key(&Self::worker_key(canonical.clone(), &tenant_id))
+        };
+
+        let store = crate::idb_store::IdbStore::new();
+        let cached_before = store.lookup(&canonical).map(|p| p.display().to_string());
+
+        let (handle, ref_token) = self.ensure_worker_with_ref(path, Some(&tenant_id)).await?;
+        let backend = {
+            let inner = self.inner.lock().await;
+            inner
+                .workers
+                .get(&handle)
+                .map(|worker| worker.backend.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        };
+
+        let database_info = self
+            .route_request(Some(&handle), "get_database_info", serde_json::json!({}))
+            .await
+            .ok();
+
+        let cached_after = store.lookup(&canonical).map(|p| p.display().to_string());
+
+        let mut closed_worker = false;
+        let mut kept_warm = false;
+        if keep_warm {
+            self.install_warm_lease(
+                canonical.clone(),
+                handle.clone(),
+                ref_token.clone(),
+                tenant_id.to_string(),
+                cached_after.as_ref().map(PathBuf::from),
+            )
+            .await?;
+            kept_warm = true;
+        } else if !already_open {
+            if let Some((_, remaining)) = self.release_ref_token(&ref_token).await {
+                if remaining == 0 {
+                    self.close_by_path(&canonical, Some(&tenant_id)).await?;
+                    closed_worker = true;
+                }
+            }
+        } else {
+            self.release_ref_token(&ref_token).await;
+        }
+
+        Ok(serde_json::json!({
+            "path": canonical.display().to_string(),
+            "backend": backend,
+            "cached_before": cached_before.is_some(),
+            "cached_after": cached_after.is_some(),
+            "cache_path": cached_after,
+            "database_info": database_info,
+            "already_open": already_open,
+            "kept_warm": kept_warm,
+            "worker_closed_after_prewarm": closed_worker,
+        }))
+    }
+
+    async fn install_warm_lease(
+        &self,
+        canonical_path: PathBuf,
+        handle: DbHandle,
+        token: String,
+        tenant_id: String,
+        cache_path: Option<PathBuf>,
+    ) -> Result<(), crate::error::ToolError> {
+        while self.warm_pool.lock().await.len() >= self.config.max_warm_workers {
+            let candidate = {
+                self.warm_pool
+                    .lock()
+                    .await
+                    .iter()
+                    .min_by_key(|(_, lease)| lease.last_hit)
+                    .map(|(path, _)| path.clone())
+            };
+            let Some(path) = candidate else { break };
+            self.release_warm_lease(&path).await?;
+        }
+
+        let lease = WarmLease {
+            handle,
+            token,
+            path: canonical_path.clone(),
+            cache_path,
+            tenant_id,
+            pinned_at: Instant::now(),
+            last_hit: Instant::now(),
+        };
+        self.warm_pool.lock().await.insert(canonical_path, lease);
+        Ok(())
+    }
+
+    async fn release_warm_lease(&self, path: &PathBuf) -> Result<(), crate::error::ToolError> {
+        if let Some(lease) = self.warm_pool.lock().await.remove(path) {
+            if let Some((handle, remaining)) = self.release_ref_token(&lease.token).await {
+                if remaining == 0 {
+                    self.close_worker(&handle).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn enqueue_prewarm(
+        &self,
+        path: &str,
+        priority: u8,
+        keep_warm: bool,
+        tenant_id: Option<String>,
+    ) -> Result<serde_json::Value, crate::error::ToolError> {
+        use crate::error::ToolError;
+
+        let tenant_id = tenant_id.unwrap_or_else(|| "default".to_string());
+        let mut queue = self.prewarm_queue.lock().await;
+        if queue.queued.len() >= self.config.max_queued_prewarms {
+            return Err(ToolError::Busy);
+        }
+        let task_id = format!("prewarm-{}", queue.next_task_id);
+        queue.next_task_id += 1;
+        queue.queued.push(QueuedPrewarmTask {
+            task_id: task_id.clone(),
+            path: path.to_string(),
+            tenant_id: tenant_id.clone(),
+            priority,
+            keep_warm,
+            enqueued_at: Instant::now(),
+        });
+        queue.queued.sort_by(|lhs, rhs| {
+            rhs.priority
+                .cmp(&lhs.priority)
+                .then_with(|| lhs.enqueued_at.cmp(&rhs.enqueued_at))
+        });
+        let queued = queue.queued.len();
+        let result = serde_json::json!({
+            "task_id": task_id,
+            "status": "queued",
+            "path": path,
+            "tenant_id": tenant_id,
+            "priority": priority,
+            "keep_warm": keep_warm,
+            "queued": queued,
+        });
+        drop(queue);
+        self.drive_prewarm_queue().await;
+        Ok(result)
+    }
+
+    pub async fn enqueue_route_task(
+        &self,
+        path: &str,
+        method: &str,
+        params: serde_json::Value,
+        tenant_id: Option<String>,
+        priority: u8,
+        dedupe_key: Option<String>,
+    ) -> Result<serde_json::Value, crate::error::ToolError> {
+        use crate::error::ToolError;
+
+        let tenant_id = Self::normalize_tenant(tenant_id.as_deref());
+        let mut queue = self.route_queue.lock().await;
+        if queue.queued.len() >= self.config.max_queued_tasks {
+            return Err(ToolError::Busy);
+        }
+
+        let active_for_tenant = queue.tenant_active.get(&tenant_id).copied().unwrap_or(0);
+        if active_for_tenant >= self.config.max_tasks_per_tenant {
+            return Err(ToolError::Busy);
+        }
+
+        let task_id = match self.task_registry.create_with_key(
+            "job",
+            dedupe_key.as_deref(),
+            &format!("Queued {method}"),
+        ) {
+            Ok(id) => id,
+            Err(existing) => existing,
+        };
+        self.task_registry.merge_meta(
+            &task_id,
+            serde_json::json!({
+                "tenant_id": tenant_id,
+                "path": path,
+                "method": method,
+                "priority": priority,
+                "remote": false,
+            }),
+        );
+
+        if self.task_registry.get(&task_id).is_some() && !queue.active.contains_key(&task_id) {
+            queue.queued.push(QueuedRouteTask {
+                task_id: task_id.clone(),
+                path: path.to_string(),
+                method: method.to_string(),
+                params,
+                tenant_id: tenant_id.clone(),
+                priority,
+                enqueued_at: Instant::now(),
+            });
+            queue.queued.sort_by(|lhs, rhs| {
+                rhs.priority
+                    .cmp(&lhs.priority)
+                    .then_with(|| lhs.enqueued_at.cmp(&rhs.enqueued_at))
+            });
+        }
+
+        let result = serde_json::json!({
+            "task_id": task_id,
+            "status": "queued",
+            "path": path,
+            "method": method,
+            "tenant_id": tenant_id,
+            "priority": priority,
+        });
+        drop(queue);
+        self.drive_route_queue().await;
+        Ok(result)
+    }
+
+    pub async fn enqueue_federated_task(
+        &self,
+        path: &str,
+        method: &str,
+        params: serde_json::Value,
+        tenant_id: Option<String>,
+        priority: u8,
+        dedupe_key: Option<String>,
+    ) -> Result<serde_json::Value, crate::error::ToolError> {
+        use crate::error::ToolError;
+
+        let tenant_id = Self::normalize_tenant(tenant_id.as_deref());
+        let nodes = self.federation_nodes_snapshot().await;
+        let candidates =
+            crate::federation::choose_ready_nodes(&nodes, Some(method), Some(&tenant_id));
+        if candidates.is_empty() {
+            return Err(ToolError::IdaError(
+                "no ready federation node available".to_string(),
+            ));
+        }
+
+        let task_id = match self.task_registry.create_with_key(
+            "federated",
+            dedupe_key.as_deref(),
+            &format!("Dispatching {method} to federation"),
+        ) {
+            Ok(id) => id,
+            Err(existing) => existing,
+        };
+        self.task_registry.merge_meta(
+            &task_id,
+            serde_json::json!({
+                "tenant_id": tenant_id,
+                "path": path,
+                "method": method,
+                "priority": priority,
+                "remote": true,
+            }),
+        );
+
+        let mut last_error = None;
+        let mut chosen = None;
+        let mut remote_task_id = None;
+        let mut remote_url = None;
+        for node in candidates {
+            let payload = serde_json::json!({
+                "path": path,
+                "method": method,
+                "priority": priority,
+                "tenant_id": tenant_id,
+                "dedupe_key": dedupe_key,
+                "task_params": params,
+                "federate": false,
+            });
+
+            match crate::federation::submit_enqueue(&node, &payload) {
+                Ok(remote) => {
+                    let task = remote
+                        .response
+                        .get("task_id")
+                        .and_then(|v| v.as_str())
+                        .map(ToOwned::to_owned);
+                    if let Some(task) = task {
+                        chosen = Some(node.clone());
+                        remote_task_id = Some(task);
+                        remote_url = Some(remote.url.clone());
+                        break;
+                    } else {
+                        last_error =
+                            Some(format!("remote node {} did not return task_id", node.name));
+                    }
+                }
+                Err(err) => {
+                    last_error = Some(format!("{}: {err}", node.name));
+                }
+            }
+        }
+
+        let Some(node) = chosen else {
+            return Err(ToolError::IdaError(format!(
+                "federation enqueue failed across all candidate nodes: {}",
+                last_error.unwrap_or_else(|| "unknown error".to_string())
+            )));
+        };
+
+        if let Some(state) = self.task_registry.get(&task_id) {
+            if state.status == TaskStatus::Running {
+                let remote_task_id = remote_task_id.expect("remote task id set");
+                self.task_registry.update_message(
+                    &task_id,
+                    &format!("Queued remotely on {} as {}", node.name, remote_task_id),
+                );
+                self.task_registry.merge_meta(
+                    &task_id,
+                    serde_json::json!({
+                        "node": node.name,
+                        "url": remote_url.clone().unwrap_or_else(|| node.url.clone()),
+                        "remote_task_id": remote_task_id,
+                    }),
+                );
+
+                let registry = self.task_registry.clone();
+                let task_id_for_poll = task_id.clone();
+                let remote_node = node.clone();
+                let remote_url = remote_url.unwrap_or_else(|| remote_node.url.clone());
+                let poll_handle = tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(2));
+                    loop {
+                        interval.tick().await;
+                        match crate::federation::fetch_remote_task(&remote_node, &remote_task_id) {
+                            Ok(remote_status) => {
+                                let payload = remote_status.payload;
+                                let status = payload
+                                    .get("status")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                let message = payload
+                                    .get("message")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(status);
+                                registry.update_message(
+                                    &task_id_for_poll,
+                                    &format!("remote {}: {}", remote_node.name, message),
+                                );
+                                match status {
+                                    "completed" => {
+                                        registry.complete(
+                                            &task_id_for_poll,
+                                            serde_json::json!({
+                                                "remote": true,
+                                                "node": remote_node.name,
+                                                "url": remote_url,
+                                                "remote_task_id": remote_task_id,
+                                                "payload": payload,
+                                            }),
+                                        );
+                                        break;
+                                    }
+                                    "failed" => {
+                                        registry.fail(
+                                            &task_id_for_poll,
+                                            &format!(
+                                                "remote {} failed: {}",
+                                                remote_node.name, message
+                                            ),
+                                        );
+                                        break;
+                                    }
+                                    "cancelled" => {
+                                        registry.fail(
+                                            &task_id_for_poll,
+                                            &format!("remote {} cancelled", remote_node.name),
+                                        );
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Err(err) => {
+                                registry.update_message(
+                                    &task_id_for_poll,
+                                    &format!("remote poll error: {err}"),
+                                );
+                            }
+                        }
+                    }
+                });
+                self.task_registry.set_handle(&task_id, poll_handle);
+            }
+        }
+
+        Ok(serde_json::json!({
+            "task_id": task_id,
+            "status": "queued",
+            "path": path,
+            "method": method,
+            "tenant_id": tenant_id,
+            "priority": priority,
+            "remote": true,
+            "node": node.name,
+            "url": node.url,
+        }))
+    }
+
+    pub fn task_state(&self, task_id: &str) -> Option<TaskState> {
+        self.task_registry.get(task_id)
+    }
+
+    pub fn list_task_states(&self) -> Vec<TaskState> {
+        self.task_registry.list_all()
+    }
+
+    pub async fn cancel_task(&self, task_id: &str) -> bool {
+        if self.task_registry.cancel(task_id) {
+            return true;
+        }
+
+        let mut queue = self.route_queue.lock().await;
+        if let Some(idx) = queue.queued.iter().position(|task| task.task_id == task_id) {
+            queue.queued.remove(idx);
+            self.task_registry
+                .fail(task_id, "Cancelled before execution");
+            return true;
+        }
+        false
+    }
+
+    async fn drive_prewarm_queue(&self) {
+        loop {
+            let task = {
+                let mut queue = self.prewarm_queue.lock().await;
+                if queue.active.len() >= self.config.max_active_prewarms {
+                    None
+                } else {
+                    let pos = queue.queued.iter().position(|task| {
+                        queue
+                            .tenant_active
+                            .get(&task.tenant_id)
+                            .copied()
+                            .unwrap_or(0)
+                            < self.config.max_prewarms_per_tenant
+                    });
+                    pos.map(|idx| {
+                        let task = queue.queued.remove(idx);
+                        queue
+                            .tenant_active
+                            .entry(task.tenant_id.clone())
+                            .and_modify(|count| *count += 1)
+                            .or_insert(1);
+                        queue.active.insert(
+                            task.task_id.clone(),
+                            ActivePrewarmTask {
+                                task_id: task.task_id.clone(),
+                                path: task.path.clone(),
+                                tenant_id: task.tenant_id.clone(),
+                                priority: task.priority,
+                                keep_warm: task.keep_warm,
+                                started_at: Instant::now(),
+                            },
+                        );
+                        task
+                    })
+                }
+            };
+
+            let Some(task) = task else { break };
+            let state = self.clone();
+            tokio::spawn(async move {
+                let result = state
+                    .prewarm_path_with_options(&task.path, task.keep_warm, &task.tenant_id)
+                    .await;
+                let mut queue = state.prewarm_queue.lock().await;
+                queue.active.remove(&task.task_id);
+                if let Some(count) = queue.tenant_active.get_mut(&task.tenant_id) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        queue.tenant_active.remove(&task.tenant_id);
+                    }
+                }
+                let summary = match result {
+                    Ok(value) => serde_json::json!({
+                        "task_id": task.task_id,
+                        "path": task.path,
+                        "tenant_id": task.tenant_id,
+                        "status": "completed",
+                        "result": value,
+                    }),
+                    Err(err) => serde_json::json!({
+                        "task_id": task.task_id,
+                        "path": task.path,
+                        "tenant_id": task.tenant_id,
+                        "status": "failed",
+                        "error": err.to_string(),
+                    }),
+                };
+                queue.recent.push(summary);
+                if queue.recent.len() > 64 {
+                    let drain = queue.recent.len() - 64;
+                    queue.recent.drain(0..drain);
+                }
+            });
+        }
+    }
+
+    async fn drive_route_queue(&self) {
+        loop {
+            let task = {
+                let mut queue = self.route_queue.lock().await;
+                if queue.active.len() >= self.config.max_active_tasks {
+                    None
+                } else {
+                    let pos = queue.queued.iter().position(|task| {
+                        queue
+                            .tenant_active
+                            .get(&task.tenant_id)
+                            .copied()
+                            .unwrap_or(0)
+                            < self.config.max_tasks_per_tenant
+                    });
+                    pos.map(|idx| {
+                        let task = queue.queued.remove(idx);
+                        queue
+                            .tenant_active
+                            .entry(task.tenant_id.clone())
+                            .and_modify(|count| *count += 1)
+                            .or_insert(1);
+                        queue.active.insert(
+                            task.task_id.clone(),
+                            ActiveRouteTask {
+                                task_id: task.task_id.clone(),
+                                path: task.path.clone(),
+                                method: task.method.clone(),
+                                tenant_id: task.tenant_id.clone(),
+                                priority: task.priority,
+                                started_at: Instant::now(),
+                            },
+                        );
+                        task
+                    })
+                }
+            };
+
+            let Some(task) = task else { break };
+            self.task_registry
+                .update_message(&task.task_id, &format!("Running {}", task.method));
+
+            let state = self.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    let (handle, token) = state
+                        .ensure_worker_with_ref(&task.path, Some(&task.tenant_id))
+                        .await?;
+                    let value = state
+                        .route_request(Some(&handle), &task.method, task.params.clone())
+                        .await?;
+                    state.release_ref_token(&token).await;
+                    Ok::<serde_json::Value, crate::error::ToolError>(value)
+                }
+                .await;
+
+                let mut queue = state.route_queue.lock().await;
+                queue.active.remove(&task.task_id);
+                if let Some(count) = queue.tenant_active.get_mut(&task.tenant_id) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        queue.tenant_active.remove(&task.tenant_id);
+                    }
+                }
+                drop(queue);
+
+                match result {
+                    Ok(value) => state.task_registry.complete(&task.task_id, value),
+                    Err(err) => state.task_registry.fail(&task.task_id, &err.to_string()),
+                }
+            });
+        }
+    }
+
+    async fn prune_caches(&self) {
+        let warm_pool = self.warm_pool.lock().await;
+        let pinned_groups: HashSet<String> = warm_pool
+            .values()
+            .filter_map(|lease| lease.cache_path.as_ref())
+            .map(|path| path.with_extension("").display().to_string())
+            .collect();
+        drop(warm_pool);
+
+        let _ = crate::idb_store::IdbStore::new()
+            .evict_to_limit(self.config.max_idb_cache_bytes, &pinned_groups);
+        let _ = crate::server::response_cache::prune_to_limit(self.config.max_response_cache_bytes);
+    }
+
     /// `auto_exit_grace`: `Some(duration)` → exit when no workers remain for that
     /// long. `None` → disable auto-exit (stdio MCP mode).
     pub fn start_watchdog(
@@ -672,6 +2041,14 @@ impl RouterState {
         check_interval: Duration,
         auto_exit_grace: Option<Duration>,
     ) {
+        if self
+            .maintenance_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
         let state = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(check_interval);
@@ -703,6 +2080,10 @@ impl RouterState {
                     let _ = state.close_worker(&handle).await;
                 }
 
+                state.drive_prewarm_queue().await;
+                state.drive_route_queue().await;
+                state.prune_caches().await;
+
                 if let Some(grace) = auto_exit_grace {
                     let worker_count = state.worker_count().await;
                     if worker_count == 0 {
@@ -730,6 +2111,40 @@ impl Default for RouterState {
     fn default() -> Self {
         Self::new().expect("Failed to create RouterState")
     }
+}
+
+pub fn task_state_json(state: &TaskState) -> serde_json::Value {
+    let status = match state.status {
+        TaskStatus::Running => "running",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
+    };
+    let mut value = serde_json::json!({
+        "task_id": state.id,
+        "status": status,
+        "message": state.message,
+        "created_at": state.created_at_iso,
+        "updated_at": state.updated_at_iso,
+        "meta": state.meta,
+        "result": state.result,
+    });
+
+    if let Some(result) = &state.result {
+        if let Some(obj) = value.as_object_mut() {
+            if let Some(remote) = result.get("remote").and_then(|v| v.as_bool()) {
+                obj.insert("remote".to_string(), serde_json::json!(remote));
+            }
+            if let Some(node) = result.get("node").and_then(|v| v.as_str()) {
+                obj.insert("node".to_string(), serde_json::json!(node));
+            }
+            if let Some(task_id) = result.get("remote_task_id").and_then(|v| v.as_str()) {
+                obj.insert("remote_task_id".to_string(), serde_json::json!(task_id));
+            }
+        }
+    }
+
+    value
 }
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
@@ -877,6 +2292,38 @@ mod tests {
             .route_request(None, "list_functions", serde_json::json!({}))
             .await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_task_state_json_exposes_meta_and_remote_fields() {
+        let now = std::time::Instant::now();
+        let state = TaskState {
+            id: "job-1".to_string(),
+            status: TaskStatus::Completed,
+            message: "Completed".to_string(),
+            meta: Some(serde_json::json!({
+                "tenant_id": "team-a",
+                "path": "/tmp/sample.bin",
+                "method": "list_functions",
+            })),
+            result: Some(serde_json::json!({
+                "remote": true,
+                "node": "node-a",
+                "remote_task_id": "task-9",
+            })),
+            created_at: now,
+            updated_at: now,
+            created_at_iso: "2026-04-17T00:00:00Z".to_string(),
+            updated_at_iso: "2026-04-17T00:00:01Z".to_string(),
+            key: None,
+        };
+
+        let value = task_state_json(&state);
+        assert_eq!(value["meta"]["tenant_id"], "team-a");
+        assert_eq!(value["meta"]["method"], "list_functions");
+        assert_eq!(value["remote"], true);
+        assert_eq!(value["node"], "node-a");
+        assert_eq!(value["remote_task_id"], "task-9");
     }
 
     #[test]

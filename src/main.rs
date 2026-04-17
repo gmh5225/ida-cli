@@ -1,4 +1,4 @@
-//! Headless IDA Pro MCP Server
+//! Headless IDA CLI and MCP Server
 //!
 //! This binary runs an MCP server that provides headless IDA Pro access
 //! via stdin/stdout transport.
@@ -14,11 +14,12 @@ use hyper::http::{header::ORIGIN, Request, Response, StatusCode};
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
+use ida_mcp::ida::{IdaBackend, RawDatabaseOptions, WorkerBackendKind};
 use ida_mcp::{
-    disasm::generate_disasm_line, expand_path, ida, rpc_dispatch, DbInfo, FunctionInfo,
+    disasm::generate_disasm_line, expand_path, federation, ida, rpc_dispatch, DbInfo, FunctionInfo,
     IdaMcpServer, IdaWorker, ServerMode,
 };
-use idalib::{idb::IDBOpenOptions, Address, IDB};
+use idalib::{Address, IDB};
 use rmcp::transport::stdio;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -39,7 +40,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter, Layer};
 const REQUEST_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Parser)]
-#[command(name = "ida-mcp", version, about = "Headless IDA Pro MCP Server")]
+#[command(name = "ida-cli", version, about = "Headless IDA CLI and MCP Server")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -53,7 +54,10 @@ enum Command {
     ServeHttp(ServeHttpArgs),
     /// Internal: worker subprocess controlled by a router.
     /// Reads JSON-RPC requests from stdin, dispatches to IDA worker, writes responses to stdout.
-    ServeWorker,
+    ServeWorker(ServeWorkerArgs),
+    /// Internal: probe the active IDA runtime and select the worker backend.
+    #[command(hide = true)]
+    ProbeRuntime,
 
     /// CLI client: send commands to a running server via Unix socket
     Cli(ida_mcp::cli::CliArgs),
@@ -83,26 +87,46 @@ struct ServeHttpArgs {
         default_value = "http://localhost,http://127.0.0.1"
     )]
     allow_origin: Vec<String>,
+    /// Maximum number of in-flight HTTP requests before returning 503.
+    #[arg(long, default_value_t = 256)]
+    max_inflight_requests: usize,
+}
+
+#[derive(Args, Clone)]
+struct ServeWorkerArgs {
+    /// Internal backend selection used by the router.
+    #[arg(long, value_enum, default_value_t = WorkerBackendKind::NativeLinked, hide = true)]
+    backend: WorkerBackendKind,
 }
 
 #[derive(Clone)]
-struct OriginCheckService<S> {
+struct GatewayService<S> {
     inner: S,
     allowed_origins: Arc<std::collections::HashSet<String>>,
+    router: ida_mcp::router::RouterState,
+    inflight_limit: Arc<tokio::sync::Semaphore>,
 }
 
-impl<S> OriginCheckService<S> {
-    fn new(inner: S, allowed_origins: Arc<std::collections::HashSet<String>>) -> Self {
+impl<S> GatewayService<S> {
+    fn new(
+        inner: S,
+        allowed_origins: Arc<std::collections::HashSet<String>>,
+        router: ida_mcp::router::RouterState,
+        inflight_limit: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
         Self {
             inner,
             allowed_origins,
+            router,
+            inflight_limit,
         }
     }
 }
 
-impl<B, S> Service<Request<B>> for OriginCheckService<S>
+impl<B, S> Service<Request<B>> for GatewayService<S>
 where
     B: http_body::Body + Send + 'static,
+    B::Data: Send + 'static,
     B::Error: std::fmt::Display,
     S: Service<
             Request<B>,
@@ -128,8 +152,80 @@ where
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
         let allowed_origins = self.allowed_origins.clone();
+        let router = self.router.clone();
+        let inflight_limit = self.inflight_limit.clone();
         let mut inner = self.inner.clone();
         Box::pin(async move {
+            let path = req.uri().path().to_string();
+
+            if req.method() == hyper::http::Method::GET {
+                if path == "/healthz" {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({"ok": true, "service": "ida-cli"}),
+                    ));
+                }
+                if path == "/readyz" {
+                    let status = router.status_snapshot().await;
+                    let ready = status
+                        .runtime_probe
+                        .as_ref()
+                        .map(|probe| probe.supported)
+                        .unwrap_or(false);
+                    let code = if ready {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    };
+                    return Ok(json_response(
+                        code,
+                        serde_json::json!({
+                            "ok": ready,
+                            "runtime_probe": status.runtime_probe,
+                            "worker_count": status.worker_count,
+                            "max_workers": status.max_workers,
+                        }),
+                    ));
+                }
+                if path == "/statusz" {
+                    let status = router.status_snapshot_federated().await;
+                    let value = serde_json::to_value(status)
+                        .unwrap_or_else(|_| serde_json::json!({"error": "status serialization failed"}));
+                    return Ok(json_response(StatusCode::OK, value));
+                }
+                if path == "/federationz" {
+                    let nodes = router.federation_nodes_snapshot().await;
+                    let statuses = crate::federation::probe_nodes(&nodes);
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({ "nodes": statuses }),
+                    ));
+                }
+                if path == "/metrics" {
+                    let status = router.status_snapshot().await;
+                    return Ok(metrics_response(&status));
+                }
+                if path == "/tasksz" {
+                    let tasks: Vec<_> = router
+                        .list_task_states()
+                        .into_iter()
+                        .map(|state| ida_mcp::router::task_state_json(&state))
+                        .collect();
+                    return Ok(json_response(StatusCode::OK, serde_json::json!({ "tasks": tasks })));
+                }
+                if let Some(task_id) = path.strip_prefix("/taskz/") {
+                    let resp = match router.task_state(task_id) {
+                        Some(state) =>
+                            json_response(StatusCode::OK, ida_mcp::router::task_state_json(&state)),
+                        None => json_response(
+                            StatusCode::NOT_FOUND,
+                            serde_json::json!({"error": "unknown task_id"}),
+                        ),
+                    };
+                    return Ok(resp);
+                }
+            }
+
             if let Some(origin) = req.headers().get(ORIGIN).and_then(|v| v.to_str().ok()) {
                 if !allowed_origins.contains(origin) {
                     let resp = Response::builder()
@@ -139,9 +235,296 @@ where
                     return Ok(resp);
                 }
             }
+
+            let Ok(_permit) = inflight_limit.clone().try_acquire_owned() else {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "server overloaded",
+                        "reason": "max in-flight request limit reached",
+                    }),
+                ));
+            };
+
+            if req.method() == hyper::http::Method::POST && path == "/enqueuez" {
+                let body = match req.into_body().collect().await {
+                    Ok(body) => body.to_bytes(),
+                    Err(err) => {
+                        return Ok(json_response(
+                            StatusCode::BAD_REQUEST,
+                            serde_json::json!({"error": format!("invalid request body: {err}")}),
+                        ));
+                    }
+                };
+                let value: serde_json::Value = match serde_json::from_slice(&body) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return Ok(json_response(
+                            StatusCode::BAD_REQUEST,
+                            serde_json::json!({"error": format!("invalid json: {err}")}),
+                        ));
+                    }
+                };
+
+                let path = value.get("path").and_then(|v| v.as_str());
+                let method = value.get("method").and_then(|v| v.as_str());
+                let priority = value
+                    .get("priority")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u8;
+                let tenant_id = value
+                    .get("tenant_id")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned);
+                let dedupe_key = value
+                    .get("dedupe_key")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned);
+                let params = value
+                    .get("task_params")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let federate = value
+                    .get("federate")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                let resp = match (path, method) {
+                    (Some(path), Some(method)) if federate => match router
+                        .enqueue_federated_task(path, method, params, tenant_id, priority, dedupe_key)
+                        .await
+                    {
+                        Ok(value) => json_response(StatusCode::OK, value),
+                        Err(err) => json_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            serde_json::json!({"error": err.to_string()}),
+                        ),
+                    },
+                    (Some(path), Some(method)) => match router
+                        .enqueue_route_task(path, method, params, tenant_id, priority, dedupe_key)
+                        .await
+                    {
+                        Ok(value) => json_response(StatusCode::OK, value),
+                        Err(err) => json_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            serde_json::json!({"error": err.to_string()}),
+                        ),
+                    },
+                    _ => json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"error": "enqueuez requires path and method"}),
+                    ),
+                };
+                return Ok(resp);
+            }
+
+            if req.method() == hyper::http::Method::POST && path == "/federationz/register" {
+                let body = match req.into_body().collect().await {
+                    Ok(body) => body.to_bytes(),
+                    Err(err) => {
+                        return Ok(json_response(
+                            StatusCode::BAD_REQUEST,
+                            serde_json::json!({"error": format!("invalid request body: {err}")}),
+                        ));
+                    }
+                };
+                let node: crate::federation::FederationNodeConfig =
+                    match serde_json::from_slice(&body) {
+                        Ok(node) => node,
+                        Err(err) => {
+                            return Ok(json_response(
+                                StatusCode::BAD_REQUEST,
+                                serde_json::json!({"error": format!("invalid federation node json: {err}")}),
+                            ));
+                        }
+                    };
+                let value = router.register_federation_node(node).await;
+                return Ok(json_response(StatusCode::OK, value));
+            }
+
+            if req.method() == hyper::http::Method::POST && path == "/federationz/heartbeat" {
+                let body = match req.into_body().collect().await {
+                    Ok(body) => body.to_bytes(),
+                    Err(err) => {
+                        return Ok(json_response(
+                            StatusCode::BAD_REQUEST,
+                            serde_json::json!({"error": format!("invalid request body: {err}")}),
+                        ));
+                    }
+                };
+                let node: federation::FederationNodeConfig = match serde_json::from_slice(&body) {
+                    Ok(node) => node,
+                    Err(err) => {
+                        return Ok(json_response(
+                            StatusCode::BAD_REQUEST,
+                            serde_json::json!({"error": format!("invalid federation heartbeat json: {err}")}),
+                        ));
+                    }
+                };
+                let value = router.heartbeat_federation_node(node).await;
+                return Ok(json_response(StatusCode::OK, value));
+            }
+
+            if req.method() == hyper::http::Method::POST && path == "/federationz/unregister" {
+                let body = match req.into_body().collect().await {
+                    Ok(body) => body.to_bytes(),
+                    Err(err) => {
+                        return Ok(json_response(
+                            StatusCode::BAD_REQUEST,
+                            serde_json::json!({"error": format!("invalid request body: {err}")}),
+                        ));
+                    }
+                };
+                let value: serde_json::Value = match serde_json::from_slice(&body) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return Ok(json_response(
+                            StatusCode::BAD_REQUEST,
+                            serde_json::json!({"error": format!("invalid json: {err}")}),
+                        ));
+                    }
+                };
+                let Some(name) = value.get("name").and_then(|v| v.as_str()) else {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"error": "missing federation node name"}),
+                    ));
+                };
+                let value = router.unregister_federation_node(name).await;
+                return Ok(json_response(StatusCode::OK, value));
+            }
+
             inner.call(req).await
         })
     }
+}
+
+fn json_response(
+    status: StatusCode,
+    value: serde_json::Value,
+) -> Response<BoxBody<Bytes, std::convert::Infallible>> {
+    let body = serde_json::to_vec(&value).unwrap_or_else(|_| b"{\"error\":\"serialization failed\"}".to_vec());
+    Response::builder()
+        .status(status)
+        .header(hyper::http::header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(body)).boxed())
+        .expect("valid response")
+}
+
+fn metrics_response(
+    status: &ida_mcp::router::RouterStatus,
+) -> Response<BoxBody<Bytes, std::convert::Infallible>> {
+    let mut lines = Vec::new();
+    lines.push("# HELP ida_cli_workers Number of live workers".to_string());
+    lines.push("# TYPE ida_cli_workers gauge".to_string());
+    lines.push(format!("ida_cli_workers {}", status.worker_count));
+
+    lines.push("# HELP ida_cli_max_workers Configured worker limit".to_string());
+    lines.push("# TYPE ida_cli_max_workers gauge".to_string());
+    lines.push(format!("ida_cli_max_workers {}", status.max_workers));
+
+    lines.push("# HELP ida_cli_max_pending_per_worker Configured per-worker queue limit".to_string());
+    lines.push("# TYPE ida_cli_max_pending_per_worker gauge".to_string());
+    lines.push(format!(
+        "ida_cli_max_pending_per_worker {}",
+        status.max_pending_per_worker
+    ));
+
+    lines.push("# HELP ida_cli_max_workers_per_tenant Configured per-tenant worker limit".to_string());
+    lines.push("# TYPE ida_cli_max_workers_per_tenant gauge".to_string());
+    lines.push(format!(
+        "ida_cli_max_workers_per_tenant {}",
+        status.max_workers_per_tenant
+    ));
+
+    lines.push("# HELP ida_cli_max_pending_per_tenant Configured per-tenant pending limit".to_string());
+    lines.push("# TYPE ida_cli_max_pending_per_tenant gauge".to_string());
+    lines.push(format!(
+        "ida_cli_max_pending_per_tenant {}",
+        status.max_pending_per_tenant
+    ));
+
+    lines.push("# HELP ida_cli_max_concurrent_spawns Configured concurrent spawn limit".to_string());
+    lines.push("# TYPE ida_cli_max_concurrent_spawns gauge".to_string());
+    lines.push(format!(
+        "ida_cli_max_concurrent_spawns {}",
+        status.max_concurrent_spawns
+    ));
+
+    lines.push("# HELP ida_cli_warm_pool_size Number of warm leased workers".to_string());
+    lines.push("# TYPE ida_cli_warm_pool_size gauge".to_string());
+    lines.push(format!("ida_cli_warm_pool_size {}", status.warm_pool.len()));
+
+    lines.push("# HELP ida_cli_prewarm_queue_depth Number of queued prewarm tasks".to_string());
+    lines.push("# TYPE ida_cli_prewarm_queue_depth gauge".to_string());
+    lines.push(format!(
+        "ida_cli_prewarm_queue_depth {}",
+        status.prewarm_queue.len()
+    ));
+
+    lines.push("# HELP ida_cli_prewarm_active Number of active prewarm tasks".to_string());
+    lines.push("# TYPE ida_cli_prewarm_active gauge".to_string());
+    lines.push(format!(
+        "ida_cli_prewarm_active {}",
+        status.prewarm_active.len()
+    ));
+
+    lines.push("# HELP ida_cli_idb_cache_bytes Size of cached databases in bytes".to_string());
+    lines.push("# TYPE ida_cli_idb_cache_bytes gauge".to_string());
+    lines.push(format!(
+        "ida_cli_idb_cache_bytes {}",
+        status.idb_cache.total_size_bytes
+    ));
+
+    lines.push("# HELP ida_cli_response_cache_bytes Size of cached responses in bytes".to_string());
+    lines.push("# TYPE ida_cli_response_cache_bytes gauge".to_string());
+    lines.push(format!(
+        "ida_cli_response_cache_bytes {}",
+        status.response_cache.total_size_bytes
+    ));
+
+    for (backend, count) in &status.backend_counts {
+        lines.push(format!(
+            "ida_cli_backend_workers{{backend=\"{}\"}} {}",
+            backend, count
+        ));
+    }
+
+    for (tenant, count) in &status.tenant_worker_counts {
+        lines.push(format!(
+            "ida_cli_tenant_workers{{tenant=\"{}\"}} {}",
+            tenant, count
+        ));
+    }
+
+    for (tenant, count) in &status.tenant_pending_counts {
+        lines.push(format!(
+            "ida_cli_tenant_pending{{tenant=\"{}\"}} {}",
+            tenant, count
+        ));
+    }
+
+    if let Some(runtime_probe) = &status.runtime_probe {
+        let supported = if runtime_probe.supported { 1 } else { 0 };
+        let backend = runtime_probe.backend.map(|b| b.to_string()).unwrap_or_default();
+        let version = runtime_probe
+            .runtime
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        lines.push(format!(
+            "ida_cli_runtime_probe{{backend=\"{}\",version=\"{}\"}} {}",
+            backend, version, supported
+        ));
+    }
+
+    let body = lines.join("\n") + "\n";
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")
+        .body(Full::new(Bytes::from(body)).boxed())
+        .expect("valid response")
 }
 
 #[derive(Args)]
@@ -212,10 +595,10 @@ fn main() -> anyhow::Result<()> {
                     .with(stderr_layer)
                     .with(file_layer)
                     .init();
-                eprintln!("[ida-mcp] log -> {log_path_str}");
+                eprintln!("[ida-cli] log -> {log_path_str}");
             }
             Err(e) => {
-                eprintln!("[ida-mcp] warn: cannot open log file {log_path_str}: {e}");
+                eprintln!("[ida-cli] warn: cannot open log file {log_path_str}: {e}");
                 tracing_subscriber::registry().with(stderr_layer).init();
             }
         }
@@ -224,7 +607,7 @@ fn main() -> anyhow::Result<()> {
     info!(
         pid = std::process::id(),
         version = env!("CARGO_PKG_VERSION"),
-        "=== ida-mcp started ==="
+        "=== ida-cli started ==="
     );
 
     // Detect if invoked as "ida-cli" → flat CLI mode
@@ -238,7 +621,7 @@ fn main() -> anyhow::Result<()> {
         let first_arg = std::env::args().nth(1);
         let is_server_mode = matches!(
             first_arg.as_deref(),
-            Some("serve" | "serve-http" | "serve-worker")
+            Some("serve" | "serve-http" | "serve-worker" | "probe-runtime")
         );
 
         if !is_server_mode {
@@ -253,10 +636,25 @@ fn main() -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Serve(ServeArgs::default())) {
         Command::Serve(args) => run_server(args),
         Command::ServeHttp(args) => run_server_http(args),
-        Command::ServeWorker => run_serve_worker(),
+        Command::ServeWorker(args) => run_serve_worker(args),
+        Command::ProbeRuntime => run_probe_runtime(),
 
         Command::Cli(args) => run_cli(args),
     }
+}
+
+fn run_probe_runtime() -> anyhow::Result<()> {
+    let probe = match std::panic::catch_unwind(|| {
+        ida::native_backend().init_library();
+        ida::native_backend().version()
+    }) {
+        Ok(Ok(version)) => ida::probe_native_runtime(version),
+        Ok(Err(err)) => ida::RuntimeProbeResult::error(err.to_string()),
+        Err(_) => ida::RuntimeProbeResult::error("native runtime probe panicked"),
+    };
+
+    println!("{}", serde_json::to_string(&probe)?);
+    Ok(())
 }
 
 fn run_cli(args: ida_mcp::cli::CliArgs) -> anyhow::Result<()> {
@@ -290,7 +688,7 @@ fn run_server(_args: ServeArgs) -> anyhow::Result<()> {
 }
 
 fn run_server_multi() -> anyhow::Result<()> {
-    info!("Starting IDA MCP Server (multi-IDB router mode)");
+    info!("Starting ida-cli server (multi-IDB router mode)");
 
     if ida_mcp::idb_store::socket_is_live() {
         let pid = std::fs::read_to_string(ida_mcp::idb_store::pid_path()).unwrap_or_default();
@@ -324,7 +722,7 @@ fn run_server_multi() -> anyhow::Result<()> {
                 std::process::id().to_string(),
             );
 
-            info!("MCP server (router mode) listening on stdio");
+            info!("ida-cli server (router mode) listening on stdio");
             let server = IdaMcpServer::new(worker.clone(), ServerMode::Router(router.clone()));
             router.start_watchdog(
                 std::time::Duration::from_secs(8 * 3600),
@@ -336,12 +734,10 @@ fn run_server_multi() -> anyhow::Result<()> {
             let socket_path = ida_mcp::idb_store::socket_path();
             let socket_path_cleanup = socket_path.clone();
             let router_for_socket = router.clone();
-            let cancel_for_socket = cancel.clone();
             tokio::spawn(async move {
                 if let Err(e) = ida_mcp::server::socket_listener::run_socket_listener(
                     socket_path,
                     router_for_socket,
-                    cancel_for_socket,
                 )
                 .await
                 {
@@ -391,7 +787,7 @@ fn run_server_multi() -> anyhow::Result<()> {
                     }
                 }
             }
-            info!("MCP server shutting down (router mode)");
+            info!("ida-cli server shutting down (router mode)");
             router.shutdown_all().await;
             let _ = std::fs::remove_file(ida_mcp::idb_store::pid_path());
             let _ = std::fs::remove_file(ida_mcp::idb_store::socket_path());
@@ -407,11 +803,15 @@ fn run_server_multi() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_serve_worker() -> anyhow::Result<()> {
+fn run_serve_worker(args: ServeWorkerArgs) -> anyhow::Result<()> {
     use ida_mcp::router::protocol::{RpcRequest, RpcResponse};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-    info!("Starting IDA MCP Server (worker mode)");
+    info!(backend = %args.backend, "Starting ida-cli worker");
+
+    if matches!(args.backend, WorkerBackendKind::IdatCompat) {
+        return ida_mcp::idat_compat::run_worker();
+    }
 
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
     let worker = IdaWorker::new(tx);
@@ -552,7 +952,7 @@ fn run_serve_worker() -> anyhow::Result<()> {
 }
 
 fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
-    info!("Starting IDA MCP Server (streamable HTTP + multi-IDB router mode)");
+    info!("Starting ida-cli server (streamable HTTP + multi-IDB router mode)");
     if args.json_response && !args.stateless {
         info!("--json-response is ignored unless --stateless is also set");
     }
@@ -634,12 +1034,10 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
             let socket_path = ida_mcp::idb_store::socket_path();
             let socket_path_cleanup = socket_path.clone();
             let router_for_socket = router.clone();
-            let cancel_for_socket = cancel.clone();
             tokio::spawn(async move {
                 if let Err(e) = ida_mcp::server::socket_listener::run_socket_listener(
                     socket_path,
                     router_for_socket,
-                    cancel_for_socket,
                 )
                 .await
                 {
@@ -654,12 +1052,19 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
                 .filter(|s| !s.is_empty())
                 .collect();
             let allowed_origins = Arc::new(allowed_origins);
-            let service = OriginCheckService::new(service, allowed_origins);
+            let inflight_limit =
+                Arc::new(tokio::sync::Semaphore::new(args.max_inflight_requests.max(1)));
+            let service = GatewayService::new(
+                service,
+                allowed_origins,
+                router.clone(),
+                inflight_limit,
+            );
 
             let listener = tokio::net::TcpListener::bind(bind_addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("bind failed: {e}"))?;
-            info!("MCP HTTP server listening on http://{bind_addr}");
+            info!("ida-cli HTTP server listening on http://{bind_addr}");
 
             let shutdown_worker = worker_for_shutdown.clone();
             let cancel_for_shutdown = cancel.clone();
@@ -723,14 +1128,14 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
 }
 
 fn run_probe(args: ProbeArgs) -> anyhow::Result<()> {
-    info!("Starting IDA MCP Server (probe mode)");
+    info!("Starting ida-cli probe mode");
     if let Ok(idadir) = std::env::var("IDADIR") {
         info!("IDADIR={}", idadir);
     }
     info!("Initializing IDA library on main thread");
-    idalib::init_library();
+    ida::native_backend().init_library();
     info!("IDA library initialized successfully");
-    if let Ok(ver) = idalib::version() {
+    if let Ok(ver) = ida::native_backend().version() {
         info!(
             "IDA version {}.{}.{}",
             ver.major(),
@@ -739,7 +1144,7 @@ fn run_probe(args: ProbeArgs) -> anyhow::Result<()> {
         );
     }
     if args.ida_console {
-        idalib::enable_console_messages(true);
+        ida::native_backend().enable_console_messages(true);
         info!("IDA console messages enabled");
     }
 
@@ -773,19 +1178,6 @@ fn run_probe(args: ProbeArgs) -> anyhow::Result<()> {
 
     let meta = db.meta();
     let path_str = path.display().to_string();
-    let idb_path = {
-        let p = std::path::Path::new(&path_str);
-        if p.extension().and_then(|e| e.to_str()) == Some("i64") {
-            Some(path_str.clone())
-        } else {
-            let db_path = db.path();
-            if db_path.extension().and_then(|e| e.to_str()) == Some("i64") {
-                Some(db_path.display().to_string())
-            } else {
-                None
-            }
-        }
-    };
     let info = DbInfo {
         path: path_str,
         file_type: format!("{:?}", meta.filetype()),
@@ -800,7 +1192,6 @@ fn run_probe(args: ProbeArgs) -> anyhow::Result<()> {
         function_count: db.function_count(),
         debug_info: None,
         analysis_status: ida::handlers::analysis::build_analysis_status(&db),
-        idb_path,
     };
     info!("Database opened in {}s", open_start.elapsed().as_secs());
     println!("{}", serde_json::to_string_pretty(&info)?);
@@ -853,25 +1244,32 @@ fn open_db_for_probe(path: &PathBuf, args: &ProbeArgs) -> Result<IDB, idalib::ID
     let is_idb = ext == "i64" || ext == "idb";
 
     if is_idb {
-        if args.auto_analyse {
+        let auto_analyse = args.auto_analyse;
+        if auto_analyse {
             info!("Opening existing IDB with auto-analysis enabled");
-            IDB::open_with(path, true, true) // auto_analyse=true, save=true to pack on close
-        } else {
-            IDB::open_with(path, false, true) // save=true to pack on close
         }
+        ida::native_backend().open_existing_database(path, auto_analyse, true)
     } else {
-        let mut opts = IDBOpenOptions::new();
-        opts.auto_analyse(true);
         let out_path = if let Some(out) = args.idb_out.as_deref() {
             PathBuf::from(out)
         } else {
-            path.with_extension("i64")
+            let store = ida_mcp::idb_store::IdbStore::new();
+            store.lookup(path).unwrap_or_else(|| store.idb_path(path))
         };
         info!(
             "Opening raw binary with auto-analysis (idb_out={})",
             out_path.display()
         );
-        opts.idb(&out_path).save(true).open(path)
+        ida::native_backend().open_raw_binary(
+            path,
+            RawDatabaseOptions {
+                auto_analyse: true,
+                save: true,
+                idb_output: &out_path,
+                file_type: None,
+                extra_args: &[],
+            },
+        )
     }
 }
 

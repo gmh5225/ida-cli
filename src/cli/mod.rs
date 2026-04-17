@@ -4,9 +4,13 @@ pub mod format;
 use crate::router::protocol::{RpcRequest, RpcResponse};
 use clap::{Parser, Subcommand};
 use format::OutputMode;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::UnixStream;
+use tokio::sync::Semaphore;
 
 #[derive(Parser)]
 pub struct CliArgs {
@@ -15,6 +19,9 @@ pub struct CliArgs {
 
     #[arg(long, global = true)]
     path: Option<String>,
+
+    #[arg(long, global = true)]
+    tenant: Option<String>,
 
     #[arg(long, global = true)]
     json: bool,
@@ -62,6 +69,71 @@ pub enum CliCommand {
         limit: usize,
     },
     ListSegments,
+    Prewarm {
+        #[arg(long)]
+        keep_warm: bool,
+        #[arg(long)]
+        queue: bool,
+        #[arg(long, default_value_t = 0)]
+        priority: u8,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
+    PrewarmMany {
+        list_file: String,
+        #[arg(long, default_value_t = 4)]
+        jobs: usize,
+        #[arg(long)]
+        keep_warm: bool,
+        #[arg(long)]
+        queue: bool,
+        #[arg(long, default_value_t = 0)]
+        priority: u8,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
+    Enqueue {
+        method: String,
+        #[arg(long, default_value_t = 0)]
+        priority: u8,
+        #[arg(long)]
+        dedupe_key: Option<String>,
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long)]
+        federate: bool,
+        #[arg(long)]
+        params: Option<String>,
+    },
+    TaskStatus {
+        task_id: String,
+    },
+    ListTasks,
+    CancelTask {
+        task_id: String,
+    },
+    FederationList,
+    FederationRegister {
+        name: String,
+        url: String,
+        #[arg(long, default_value_t = 1)]
+        weight: u32,
+    },
+    FederationUnregister {
+        name: String,
+    },
+    FederationHeartbeat {
+        name: String,
+        url: String,
+        #[arg(long, default_value_t = 1)]
+        weight: u32,
+        #[arg(long)]
+        capability: Vec<String>,
+        #[arg(long)]
+        tenant_allow: Vec<String>,
+        #[arg(long)]
+        node_id: Option<String>,
+    },
     Close,
     Status,
     Shutdown,
@@ -92,13 +164,130 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
 
     match args.command {
         CliCommand::Pipe => run_pipe(&socket_path, args.path.as_deref(), &output_mode).await,
+        CliCommand::PrewarmMany {
+            list_file,
+            jobs,
+            keep_warm,
+            queue,
+            priority,
+            tenant,
+        } => {
+            run_prewarm_many(
+                &socket_path,
+                &list_file,
+                jobs.max(1),
+                keep_warm,
+                queue,
+                priority,
+                tenant,
+                &output_mode,
+                timeout,
+            )
+            .await
+        }
+        CliCommand::Enqueue {
+            method,
+            priority,
+            dedupe_key,
+            tenant,
+            federate,
+            params,
+        } => {
+            let mut payload = serde_json::Map::new();
+            if let Some(path) = args.path.as_deref() {
+                payload.insert("path".to_string(), serde_json::json!(path));
+            }
+            payload.insert("method".to_string(), serde_json::json!(method));
+            payload.insert("priority".to_string(), serde_json::json!(priority));
+            payload.insert("federate".to_string(), serde_json::json!(federate));
+            if let Some(tenant) = tenant {
+                payload.insert("tenant_id".to_string(), serde_json::json!(tenant));
+            }
+            if let Some(dedupe_key) = dedupe_key {
+                payload.insert("dedupe_key".to_string(), serde_json::json!(dedupe_key));
+            }
+            if let Some(params) = params {
+                let value: serde_json::Value = serde_json::from_str(&params)?;
+                payload.insert("task_params".to_string(), value);
+            }
+            let req = RpcRequest::new("1", "enqueue", serde_json::Value::Object(payload));
+            let resp = send_request(&socket_path, &req, timeout).await?;
+            handle_response(&resp, "enqueue", &output_mode)
+        }
+        CliCommand::TaskStatus { task_id } => {
+            let req = RpcRequest::new("1", "task_status", serde_json::json!({ "task_id": task_id }));
+            let resp = send_request(&socket_path, &req, timeout).await?;
+            handle_response(&resp, "task_status", &output_mode)
+        }
+        CliCommand::ListTasks => {
+            let req = RpcRequest::new("1", "list_tasks", serde_json::json!({}));
+            let resp = send_request(&socket_path, &req, timeout).await?;
+            handle_response(&resp, "list_tasks", &output_mode)
+        }
+        CliCommand::CancelTask { task_id } => {
+            let req = RpcRequest::new("1", "cancel_task", serde_json::json!({ "task_id": task_id }));
+            let resp = send_request(&socket_path, &req, timeout).await?;
+            handle_response(&resp, "cancel_task", &output_mode)
+        }
+        CliCommand::FederationList => {
+            let body = reqwest_blocking_like("GET", &admin_url("/federationz"), None)?;
+            println!("{body}");
+            Ok(())
+        }
+        CliCommand::FederationRegister { name, url, weight } => {
+            let body = reqwest_blocking_like(
+                "POST",
+                &admin_url("/federationz/register"),
+                Some(serde_json::json!({
+                    "name": name,
+                    "url": url,
+                    "weight": weight,
+                    "enabled": true,
+                })),
+            )?;
+            println!("{body}");
+            Ok(())
+        }
+        CliCommand::FederationUnregister { name } => {
+            let body = reqwest_blocking_like(
+                "POST",
+                &admin_url("/federationz/unregister"),
+                Some(serde_json::json!({ "name": name })),
+            )?;
+            println!("{body}");
+            Ok(())
+        }
+        CliCommand::FederationHeartbeat {
+            name,
+            url,
+            weight,
+            capability,
+            tenant_allow,
+            node_id,
+        } => {
+            let body = reqwest_blocking_like(
+                "POST",
+                &admin_url("/federationz/heartbeat"),
+                Some(serde_json::json!({
+                    "name": name,
+                    "url": url,
+                    "weight": weight,
+                    "enabled": true,
+                    "capabilities": capability,
+                    "tenant_allow": tenant_allow,
+                    "node_id": node_id,
+                })),
+            )?;
+            println!("{body}");
+            Ok(())
+        }
         CliCommand::Raw { json_str } => {
             let req = complete_envelope(&json_str, 1)?;
             let resp = send_request(&socket_path, &req, timeout).await?;
             handle_response(&resp, &req.method, &output_mode)
         }
         cmd => {
-            let (method, params) = build_rpc_params(&cmd, args.path.as_deref());
+            let (method, params) = build_rpc_params(&cmd, args.path.as_deref(), args.tenant.as_deref());
             let req = RpcRequest::new("1", &method, params);
             let resp = send_request(&socket_path, &req, timeout).await?;
             handle_response(&resp, &method, &output_mode)
@@ -106,10 +295,17 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
     }
 }
 
-fn build_rpc_params(cmd: &CliCommand, path: Option<&str>) -> (String, serde_json::Value) {
+fn build_rpc_params(
+    cmd: &CliCommand,
+    path: Option<&str>,
+    tenant: Option<&str>,
+) -> (String, serde_json::Value) {
     let mut params = serde_json::Map::new();
     if let Some(p) = path {
         params.insert("path".to_string(), serde_json::json!(p));
+    }
+    if let Some(tenant) = tenant {
+        params.insert("tenant_id".to_string(), serde_json::json!(tenant));
     }
 
     let method = match cmd {
@@ -154,13 +350,88 @@ fn build_rpc_params(cmd: &CliCommand, path: Option<&str>) -> (String, serde_json
             "list_strings"
         }
         CliCommand::ListSegments => "list_segments",
+        CliCommand::Prewarm {
+            keep_warm,
+            queue,
+            priority,
+            tenant,
+        } => {
+            params.insert("keep_warm".to_string(), serde_json::json!(keep_warm));
+            params.insert("queue".to_string(), serde_json::json!(queue));
+            params.insert("priority".to_string(), serde_json::json!(priority));
+            if let Some(tenant) = tenant {
+                params.insert("tenant_id".to_string(), serde_json::json!(tenant));
+            }
+            "prewarm"
+        }
         CliCommand::Close => "close",
         CliCommand::Status => "status",
         CliCommand::Shutdown => "shutdown",
+        CliCommand::Enqueue { .. }
+        | CliCommand::TaskStatus { .. }
+        | CliCommand::ListTasks
+        | CliCommand::CancelTask { .. }
+        | CliCommand::FederationList
+        | CliCommand::FederationRegister { .. }
+        | CliCommand::FederationUnregister { .. }
+        | CliCommand::FederationHeartbeat { .. } => unreachable!(),
+        CliCommand::PrewarmMany { .. } => unreachable!(),
         _ => unreachable!(),
     };
 
     (method.to_string(), serde_json::Value::Object(params))
+}
+
+fn admin_url(path: &str) -> String {
+    let base = std::env::var("IDA_CLI_ADMIN_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:9876".to_string());
+    format!("{}{}", base.trim_end_matches('/'), path)
+}
+
+fn reqwest_blocking_like(
+    method: &str,
+    url: &str,
+    body: Option<serde_json::Value>,
+) -> anyhow::Result<String> {
+    let uri: hyper::Uri = url.parse()?;
+    let host = uri
+        .host()
+        .ok_or_else(|| anyhow::anyhow!("missing host in url"))?;
+    let port = uri.port_u16().unwrap_or(80);
+    let path = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let mut stream = TcpStream::connect((host, port))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+
+    let body_bytes = body
+        .map(|value| serde_json::to_vec(&value))
+        .transpose()?
+        .unwrap_or_default();
+
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: application/json\r\n"
+    );
+    if !body_bytes.is_empty() {
+        request.push_str("Content-Type: application/json\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
+    }
+    request.push_str("\r\n");
+
+    stream.write_all(request.as_bytes())?;
+    if !body_bytes.is_empty() {
+        stream.write_all(&body_bytes)?;
+    }
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let body = response
+        .split("\r\n\r\n")
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("invalid http response"))?;
+    Ok(body.to_string())
 }
 
 fn complete_envelope(raw: &str, seq: u64) -> anyhow::Result<RpcRequest> {
@@ -225,6 +496,77 @@ async fn send_request(
     }
 
     serde_json::from_str(line.trim()).map_err(|e| anyhow::anyhow!("Invalid response: {e}"))
+}
+
+async fn run_prewarm_many(
+    socket_path: &PathBuf,
+    list_file: &str,
+    jobs: usize,
+    keep_warm: bool,
+    queue: bool,
+    priority: u8,
+    tenant: Option<String>,
+    output_mode: &OutputMode,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    let content = std::fs::read_to_string(list_file)?;
+    let paths: Vec<String> = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToOwned::to_owned)
+        .collect();
+
+    let semaphore = Arc::new(Semaphore::new(jobs));
+    let mut handles = Vec::new();
+
+    for (idx, path) in paths.iter().enumerate() {
+        let socket_path = socket_path.clone();
+        let path = path.clone();
+        let semaphore = semaphore.clone();
+        let tenant = tenant.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
+            let req = RpcRequest::new(
+                format!("prewarm-{idx}"),
+                "prewarm",
+                serde_json::json!({
+                    "path": path,
+                    "keep_warm": keep_warm,
+                    "queue": queue,
+                    "priority": priority,
+                    "tenant_id": tenant,
+                }),
+            );
+            let resp = send_request(&socket_path, &req, timeout).await;
+            (path, resp)
+        }));
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        let (path, resp) = handle.await?;
+        match resp {
+            Ok(response) => {
+                let value = if let Some(error) = response.error {
+                    serde_json::json!({ "path": path, "ok": false, "error": error.message })
+                } else {
+                    serde_json::json!({ "path": path, "ok": true, "result": response.result })
+                };
+                results.push(value);
+            }
+            Err(err) => {
+                results.push(serde_json::json!({ "path": path, "ok": false, "error": err.to_string() }));
+            }
+        }
+    }
+
+    let output = serde_json::json!({
+        "count": results.len(),
+        "results": results,
+    });
+    println!("{}", format::format_response(output_mode, "prewarm_many", &output));
+    Ok(())
 }
 
 fn handle_response(resp: &RpcResponse, method: &str, mode: &OutputMode) -> anyhow::Result<()> {

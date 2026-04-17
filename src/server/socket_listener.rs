@@ -14,7 +14,7 @@ pub async fn run_socket_listener(socket_path: PathBuf, router: RouterState) -> a
     let listener = UnixListener::bind(&socket_path)?;
     info!("CLI socket listening on {:?}", socket_path);
 
-    let discovery_path = std::path::Path::new("/tmp/ida-mcp.socket");
+    let discovery_path = std::path::Path::new("/tmp/ida-cli.socket");
     std::fs::write(discovery_path, socket_path.to_string_lossy().as_bytes())?;
 
     loop {
@@ -30,7 +30,7 @@ pub async fn run_socket_listener(socket_path: PathBuf, router: RouterState) -> a
 
 pub fn cleanup_socket_files(socket_path: &std::path::Path) {
     let _ = std::fs::remove_file(socket_path);
-    let _ = std::fs::remove_file("/tmp/ida-mcp.socket");
+    let _ = std::fs::remove_file("/tmp/ida-cli.socket");
 }
 
 async fn handle_cli_connection(
@@ -96,13 +96,18 @@ async fn dispatch_cli_request(
         .get("path")
         .and_then(|v| v.as_str())
         .map(String::from);
+    let tenant_id = req
+        .params
+        .get("tenant_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     match method {
         "close" => {
             let resp = if let Some(ref p) = path {
                 let canonical =
                     std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
-                match router.close_by_path(&canonical).await {
+                match router.close_by_path(&canonical, tenant_id.as_deref()).await {
                     Ok(()) => RpcResponse::ok(&req.id, serde_json::json!({"ok": true})),
                     Err(e) => RpcResponse::err(&req.id, -32000, e.to_string()),
                 }
@@ -122,21 +127,166 @@ async fn dispatch_cli_request(
         }
 
         "status" => {
-            let handles = router.all_handles().await;
+            let status = router.status_snapshot().await;
             let resp = RpcResponse::ok(
                 &req.id,
-                serde_json::json!({
-                    "worker_count": handles.len(),
-                    "workers": handles,
-                }),
+                serde_json::to_value(status).unwrap_or_else(|_| serde_json::json!({})),
             );
+            (resp, None)
+        }
+        "list_tasks" => {
+            let tasks: Vec<_> = router
+                .list_task_states()
+                .into_iter()
+                .map(|state| crate::router::task_state_json(&state))
+                .collect();
+            let resp = RpcResponse::ok(&req.id, serde_json::json!({ "tasks": tasks }));
+            (resp, None)
+        }
+        "task_status" => {
+            let task_id = req
+                .params
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let resp = match task_id.and_then(|id| router.task_state(&id)) {
+                Some(state) => RpcResponse::ok(&req.id, crate::router::task_state_json(&state)),
+                None => RpcResponse::err(&req.id, -32001, "unknown task_id"),
+            };
+            (resp, None)
+        }
+        "enqueue" => {
+            let method_name = req
+                .params
+                .get("method")
+                .and_then(|v| v.as_str())
+                .map(primary_name_for)
+                .map(str::to_string);
+            let priority = req
+                .params
+                .get("priority")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u8;
+            let tenant_id = req
+                .params
+                .get("tenant_id")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned);
+            let dedupe_key = req
+                .params
+                .get("dedupe_key")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned);
+            let task_params = req
+                .params
+                .get("task_params")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let federate = req
+                .params
+                .get("federate")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let resp = match (path.as_deref(), method_name.as_deref()) {
+                (Some(path), Some(method)) if federate => {
+                    match router
+                        .enqueue_federated_task(
+                            path,
+                            method,
+                            task_params,
+                            tenant_id,
+                            priority,
+                            dedupe_key,
+                        )
+                        .await
+                    {
+                        Ok(value) => RpcResponse::ok(&req.id, value),
+                        Err(err) => RpcResponse::err(&req.id, -32000, err.to_string()),
+                    }
+                }
+                (Some(path), Some(method)) => match router
+                    .enqueue_route_task(path, method, task_params, tenant_id, priority, dedupe_key)
+                    .await
+                {
+                    Ok(value) => RpcResponse::ok(&req.id, value),
+                    Err(err) => RpcResponse::err(&req.id, -32000, err.to_string()),
+                },
+                _ => RpcResponse::err(
+                    &req.id,
+                    -32001,
+                    "enqueue requires path and method",
+                ),
+            };
+            (resp, None)
+        }
+        "cancel_task" => {
+            let task_id = req
+                .params
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let resp = match task_id {
+                Some(task_id) => {
+                    if router.cancel_task(&task_id).await {
+                        RpcResponse::ok(
+                            &req.id,
+                            serde_json::json!({ "ok": true, "task_id": task_id }),
+                        )
+                    } else {
+                        RpcResponse::err(&req.id, -32001, "task not found")
+                    }
+                }
+                None => RpcResponse::err(&req.id, -32001, "cancel_task requires task_id"),
+            };
+            (resp, None)
+        }
+
+        "prewarm" => {
+            let resp = if let Some(ref p) = path {
+                let queue = req.params.get("queue").and_then(|v| v.as_bool()).unwrap_or(false);
+                let keep_warm = req
+                    .params
+                    .get("keep_warm")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let priority = req
+                    .params
+                    .get("priority")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u8;
+                let tenant_id = req
+                    .params
+                    .get("tenant_id")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned);
+
+                let result = if queue {
+                    router.enqueue_prewarm(p, priority, keep_warm, tenant_id).await
+                } else {
+                    router
+                        .prewarm_path_with_options(
+                            p,
+                            keep_warm,
+                            tenant_id.as_deref().unwrap_or("default"),
+                        )
+                        .await
+                };
+
+                match result {
+                    Ok(value) => RpcResponse::ok(&req.id, value),
+                    Err(e) => RpcResponse::err(&req.id, -32000, e.to_string()),
+                }
+            } else {
+                RpcResponse::err(&req.id, -32001, "prewarm requires 'path' parameter")
+            };
             (resp, None)
         }
 
         _ => {
             let resolve_result = if let Some(ref p) = path {
                 router
-                    .ensure_worker_with_ref(p)
+                    .ensure_worker_with_ref(p, tenant_id.as_deref())
                     .await
                     .map(|(h, token)| (h, Some(token)))
             } else {
