@@ -1609,51 +1609,81 @@ impl RouterState {
 
         let tenant_id = Self::normalize_tenant(tenant_id.as_deref());
         let nodes = crate::federation::load_nodes_from_env();
-        let node = crate::federation::choose_ready_node(&nodes).ok_or_else(|| {
-            ToolError::IdaError("no ready federation node available".to_string())
-        })?;
+        let candidates = crate::federation::choose_ready_nodes(&nodes);
+        if candidates.is_empty() {
+            return Err(ToolError::IdaError(
+                "no ready federation node available".to_string(),
+            ));
+        }
 
         let task_id = match self.task_registry.create_with_key(
             "federated",
             dedupe_key.as_deref(),
-            &format!("Dispatching {method} to {}", node.name),
+            &format!("Dispatching {method} to federation"),
         ) {
             Ok(id) => id,
             Err(existing) => existing,
         };
 
+        let mut last_error = None;
+        let mut chosen = None;
+        let mut remote_task_id = None;
+        let mut remote_url = None;
+        for node in candidates {
+            let payload = serde_json::json!({
+                "path": path,
+                "method": method,
+                "priority": priority,
+                "tenant_id": tenant_id,
+                "dedupe_key": dedupe_key,
+                "task_params": params,
+                "federate": false,
+            });
+
+            match crate::federation::submit_enqueue(&node, &payload) {
+                Ok(remote) => {
+                    let task = remote
+                        .response
+                        .get("task_id")
+                        .and_then(|v| v.as_str())
+                        .map(ToOwned::to_owned);
+                    if let Some(task) = task {
+                        chosen = Some(node.clone());
+                        remote_task_id = Some(task);
+                        remote_url = Some(remote.url.clone());
+                        break;
+                    } else {
+                        last_error = Some(format!(
+                            "remote node {} did not return task_id",
+                            node.name
+                        ));
+                    }
+                }
+                Err(err) => {
+                    last_error = Some(format!("{}: {err}", node.name));
+                }
+            }
+        }
+
+        let Some(node) = chosen else {
+            return Err(ToolError::IdaError(format!(
+                "federation enqueue failed across all candidate nodes: {}",
+                last_error.unwrap_or_else(|| "unknown error".to_string())
+            )));
+        };
+
         if let Some(state) = self.task_registry.get(&task_id) {
-            if state.status == TaskStatus::Running && state.message.contains("Dispatching") {
-                let payload = serde_json::json!({
-                    "path": path,
-                    "method": method,
-                    "priority": priority,
-                    "tenant_id": tenant_id,
-                    "dedupe_key": dedupe_key,
-                    "task_params": params,
-                    "federate": false,
-                });
-
-                let remote = crate::federation::submit_enqueue(&node, &payload)
-                    .map_err(|e| ToolError::IdaError(format!("remote enqueue failed: {e}")))?;
-                let remote_task_id = remote
-                    .response
-                    .get("task_id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        ToolError::IdaError("remote node did not return task_id".to_string())
-                    })?
-                    .to_string();
-
+            if state.status == TaskStatus::Running {
+                let remote_task_id = remote_task_id.expect("remote task id set");
                 self.task_registry.update_message(
                     &task_id,
-                    &format!("Queued remotely on {} as {}", remote.node, remote_task_id),
+                    &format!("Queued remotely on {} as {}", node.name, remote_task_id),
                 );
 
                 let registry = self.task_registry.clone();
                 let task_id_for_poll = task_id.clone();
                 let remote_node = node.clone();
-                let remote_url = remote.url.clone();
+                let remote_url = remote_url.unwrap_or_else(|| remote_node.url.clone());
                 let poll_handle = tokio::spawn(async move {
                     let mut interval = tokio::time::interval(Duration::from_secs(2));
                     loop {

@@ -72,6 +72,10 @@ pub fn probe_nodes(nodes: &[FederationNodeConfig]) -> Vec<FederationNodeStatus> 
 }
 
 pub fn choose_ready_node(nodes: &[FederationNodeConfig]) -> Option<FederationNodeConfig> {
+    choose_ready_nodes(nodes).into_iter().next()
+}
+
+pub fn choose_ready_nodes(nodes: &[FederationNodeConfig]) -> Vec<FederationNodeConfig> {
     let mut ready: Vec<(FederationNodeConfig, FederationNodeStatus)> = nodes
         .iter()
         .filter(|node| node.enabled)
@@ -85,7 +89,7 @@ pub fn choose_ready_node(nodes: &[FederationNodeConfig]) -> Option<FederationNod
         let rhs = node_rank(rhs_node, rhs_status);
         lhs.partial_cmp(&rhs).unwrap_or(std::cmp::Ordering::Equal)
     });
-    ready.into_iter().map(|(node, _)| node).next()
+    ready.into_iter().map(|(node, _)| node).collect()
 }
 
 pub fn submit_enqueue(
