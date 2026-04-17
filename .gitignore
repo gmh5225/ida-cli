@@ -22,6 +22,8 @@ target
 
 # Dev
 sdk/
+target-aot/
+assets/
 
 # Release
 dist/
